@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use ralph_adapters::{
-    CliBackend, CliExecutor, ConsoleStreamHandler, JsonRpcStreamHandler,
+    AcpExecutor, CliBackend, CliExecutor, ConsoleStreamHandler, JsonRpcStreamHandler,
     OutputFormat as BackendOutputFormat, PrettyStreamHandler, PtyConfig, PtyExecutor,
     QuietStreamHandler, TuiStreamHandler,
 };
@@ -1115,7 +1115,9 @@ pub async fn run_loop_impl(
                                 ralph_core::HatBackend::NamedWithArgs { backend_type, .. } => {
                                     backend_type.clone()
                                 }
-                                ralph_core::HatBackend::KiroAgent { .. } => "kiro".to_string(),
+                                ralph_core::HatBackend::KiroAgent { backend_type, .. } => {
+                                    backend_type.clone()
+                                }
                                 // For Custom backends, extract command name from path
                                 // Handles both Unix ("/usr/bin/codex") and commands with args ("ollama run llama3")
                                 ralph_core::HatBackend::Custom { command, .. } => {
@@ -1195,7 +1197,16 @@ pub async fn run_loop_impl(
         let tui_lines_for_pty = tui_lines.clone();
         let rpc_stdout_for_pty = rpc_stdout.clone();
         let execute_future = async {
-            if use_pty {
+            if effective_backend.output_format == BackendOutputFormat::Acp {
+                execute_acp(
+                    &effective_backend,
+                    &config,
+                    &prompt,
+                    verbosity,
+                    tui_lines_for_pty,
+                )
+                .await
+            } else if use_pty {
                 execute_pty(
                     pty_executor.as_mut(),
                     &effective_backend,
@@ -1498,6 +1509,49 @@ fn prepare_tui_iteration(
     state.max_iterations = Some(max_iterations);
     state.start_new_iteration_with_metadata(Some(hat_display), Some(backend));
     state.latest_iteration_lines_handle()
+}
+
+/// Execute a prompt via ACP (Agent Client Protocol) for kiro-acp backend.
+async fn execute_acp(
+    backend: &CliBackend,
+    config: &RalphConfig,
+    prompt: &str,
+    verbosity: Verbosity,
+    tui_lines: Option<Arc<std::sync::Mutex<Vec<ratatui::text::Line<'static>>>>>,
+) -> Result<ExecutionOutcome> {
+    let executor = AcpExecutor::new(backend.clone(), config.core.workspace_root.clone());
+
+    let pty_result = if let Some(lines) = tui_lines {
+        let mut handler = TuiStreamHandler::with_lines(verbosity == Verbosity::Verbose, lines);
+        executor.execute(prompt, &mut handler).await?
+    } else {
+        match verbosity {
+            Verbosity::Quiet => {
+                let mut handler = QuietStreamHandler;
+                executor.execute(prompt, &mut handler).await?
+            }
+            Verbosity::Normal => {
+                let mut handler = ConsoleStreamHandler::new(false);
+                executor.execute(prompt, &mut handler).await?
+            }
+            Verbosity::Verbose => {
+                let mut handler = ConsoleStreamHandler::new(true);
+                executor.execute(prompt, &mut handler).await?
+            }
+        }
+    };
+
+    let output = if pty_result.extracted_text.is_empty() {
+        pty_result.stripped_output
+    } else {
+        pty_result.extracted_text
+    };
+
+    Ok(ExecutionOutcome {
+        output,
+        success: pty_result.success,
+        termination: None,
+    })
 }
 
 async fn execute_pty(
