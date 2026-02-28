@@ -28,6 +28,8 @@ pub struct JsonRpcStreamHandler<W: Write + Send> {
     backend: Option<String>,
     /// Tool call start times for duration tracking.
     tool_start_times: std::collections::HashMap<String, Instant>,
+    /// Set to true after a broken pipe; suppresses all further writes.
+    poisoned: bool,
 }
 
 impl<W: Write + Send> JsonRpcStreamHandler<W> {
@@ -50,6 +52,7 @@ impl<W: Write + Send> JsonRpcStreamHandler<W> {
             hat,
             backend,
             tool_start_times: std::collections::HashMap::new(),
+            poisoned: false,
         }
     }
 
@@ -70,14 +73,24 @@ impl<W: Write + Send> JsonRpcStreamHandler<W> {
 
     /// Writes an event to the output, handling errors gracefully.
     fn emit(&mut self, event: RpcEvent) {
+        if self.poisoned {
+            return;
+        }
         let line = emit_event_line(&event);
         if let Ok(mut writer) = self.writer.lock() {
             if let Err(e) = writer.write_all(line.as_bytes()) {
                 warn!(error = %e, "Failed to write JSON-RPC event");
+                if e.kind() == io::ErrorKind::BrokenPipe {
+                    self.poisoned = true;
+                }
+                return;
             }
             // Flush immediately to ensure events are delivered promptly
             if let Err(e) = writer.flush() {
                 warn!(error = %e, "Failed to flush JSON-RPC event");
+                if e.kind() == io::ErrorKind::BrokenPipe {
+                    self.poisoned = true;
+                }
             }
         }
     }
@@ -344,5 +357,60 @@ mod tests {
         let json = parse_json_line(output.trim());
 
         assert_eq!(json["duration_ms"], 0);
+    }
+
+    /// A writer that returns BrokenPipe on every write, simulating a disconnected consumer.
+    struct BrokenPipeWriter {
+        write_attempts: std::cell::Cell<u32>,
+    }
+
+    impl BrokenPipeWriter {
+        fn new() -> Self {
+            Self {
+                write_attempts: std::cell::Cell::new(0),
+            }
+        }
+
+        fn attempts(&self) -> u32 {
+            self.write_attempts.get()
+        }
+    }
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            self.write_attempts.set(self.write_attempts.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Broken pipe (os error 32)",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_broken_pipe_stops_emitting_after_first_failure() {
+        let writer = Arc::new(Mutex::new(BrokenPipeWriter::new()));
+        let mut handler = JsonRpcStreamHandler::new(
+            writer.clone(),
+            1,
+            Some("builder".to_string()),
+            Some("claude".to_string()),
+        );
+
+        // Emit many events — simulates the log spam from the bug report
+        for i in 0..10 {
+            handler.on_text(&format!("event {i}"));
+        }
+
+        let attempts = writer.lock().unwrap().attempts();
+        // BUG: currently all 10 writes are attempted, producing 10 WARN logs.
+        // After fix, only 1 write should be attempted before the handler stops.
+        assert_eq!(
+            attempts, 1,
+            "should stop writing after first broken pipe, but attempted {attempts} writes"
+        );
     }
 }

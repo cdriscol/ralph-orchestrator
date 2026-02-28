@@ -610,6 +610,24 @@ pub struct EventLoopConfig {
     /// max_cost), consecutive failures, or explicit interrupt/stop.
     #[serde(default)]
     pub persistent: bool,
+
+    /// Event topics that must have been seen before LOOP_COMPLETE is accepted.
+    /// If any required event has not been seen during the loop's lifetime,
+    /// completion is rejected and a task.resume event is injected.
+    #[serde(default)]
+    pub required_events: Vec<String>,
+
+    /// Event topic that triggers graceful early termination WITHOUT chain validation.
+    /// Use this for human rejection, timeout escalation, or other abort paths.
+    /// Defaults to "" (disabled). Set to "loop.cancel" to enable.
+    #[serde(default)]
+    pub cancellation_promise: String,
+
+    /// When true, events emitted by a hat are validated against its declared
+    /// `publishes` list. Out-of-scope events are dropped and replaced with
+    /// `{hat_id}.scope_violation` diagnostic events. Defaults to false (permissive).
+    #[serde(default)]
+    pub enforce_hat_scope: bool,
 }
 
 fn default_prompt_file() -> String {
@@ -647,6 +665,9 @@ impl Default for EventLoopConfig {
             starting_event: None,
             mutation_score_warn_threshold: None,
             persistent: false,
+            required_events: Vec::new(),
+            cancellation_promise: String::new(),
+            enforce_hat_scope: false,
         }
     }
 }
@@ -1266,6 +1287,14 @@ pub struct HatConfig {
     /// When the limit is exceeded, the orchestrator publishes `<hat_id>.exhausted`
     /// instead of activating the hat again.
     pub max_activations: Option<u32>,
+
+    /// Tools the hat is not allowed to use.
+    ///
+    /// Injected as a TOOL RESTRICTIONS section in the prompt (soft enforcement).
+    /// After each iteration, a file-modification audit checks compliance when
+    /// `Edit` or `Write` are disallowed (hard enforcement via scope_violation event).
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
 }
 
 impl HatConfig {

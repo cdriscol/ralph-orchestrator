@@ -21,7 +21,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, stdin, stdout};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -241,9 +241,18 @@ pub async fn run_loop_impl(
         } else {
             0
         };
+        // In autonomous (non-interactive) mode, use a very wide PTY to prevent
+        // line wrapping of long NDJSON output (Pi emits 800+ char JSON lines that
+        // get garbled when the PTY wraps at 80 columns).
+        let cols = if user_interactive {
+            PtyConfig::from_env().cols
+        } else {
+            32768
+        };
         let pty_config = PtyConfig {
             interactive: user_interactive,
             idle_timeout_secs,
+            cols,
             workspace_root: config.core.workspace_root.clone(),
             ..PtyConfig::from_env()
         };
@@ -571,11 +580,13 @@ pub async fn run_loop_impl(
                 TerminationReason::MaxCost => "max_cost",
                 TerminationReason::ConsecutiveFailures => "consecutive_failures",
                 TerminationReason::LoopThrashing => "loop_thrashing",
+                TerminationReason::LoopStale => "loop_stale",
                 TerminationReason::ValidationFailure => "validation_failure",
                 TerminationReason::Stopped => "stopped",
                 TerminationReason::Interrupted => "interrupted",
                 TerminationReason::RestartRequested => "restart_requested",
                 TerminationReason::WorkspaceGone => "workspace_gone",
+                TerminationReason::Cancelled => "cancelled",
             };
 
             if matches!(reason, TerminationReason::Interrupted) {
@@ -639,12 +650,14 @@ pub async fn run_loop_impl(
                     TerminationReason::MaxCost => "max cost exceeded",
                     TerminationReason::ConsecutiveFailures => "consecutive failures",
                     TerminationReason::LoopThrashing => "loop thrashing detected",
+                    TerminationReason::LoopStale => "stale loop detected",
                     TerminationReason::ValidationFailure => "validation failure",
                     TerminationReason::Stopped => "manually stopped",
                     TerminationReason::Interrupted => "interrupted by signal",
                     TerminationReason::CompletionPromise => unreachable!(),
                     TerminationReason::RestartRequested => "restart requested",
                     TerminationReason::WorkspaceGone => "workspace directory removed",
+                    TerminationReason::Cancelled => "cancelled by human",
                 };
                 if let Err(e) = queue.mark_needs_review(loop_id, reason_str) {
                     warn!(loop_id = %loop_id, error = %e, "Failed to mark merge as needs-review");
@@ -1393,6 +1406,31 @@ pub async fn run_loop_impl(
             }
         }
 
+        // Check cancellation first (no chain validation) — takes priority over completion
+        if let Some(reason) = event_loop.check_cancellation_event() {
+            info!("Loop cancelled gracefully via loop.cancel event.");
+
+            let terminate_event = event_loop.publish_terminate_event(&reason);
+            log_terminate_event(
+                &mut event_logger,
+                event_loop.state().iteration,
+                &terminate_event,
+            );
+            handle_termination(
+                &reason,
+                event_loop.state(),
+                &config.core.scratchpad,
+                &loop_history,
+                &loop_context,
+                auto_merge,
+                &prompt_content,
+            );
+            if let Some(handle) = tui_handle.take() {
+                let _ = handle.await;
+            }
+            return Ok(reason);
+        }
+
         if let Some(reason) = event_loop.check_completion_event() {
             info!(
                 "Completion event {} detected.",
@@ -2057,6 +2095,32 @@ fn process_pending_merges_with_command(repo_root: &Path, ralph_cmd: &OsStr) {
 
         info!(loop_id = %loop_id, "Spawning merge-ralph process");
 
+        // Redirect subprocess stdio to a log file to prevent TUI corruption.
+        // If log file creation fails, fall back to Stdio::null rather than
+        // inheriting the parent's terminal (which would corrupt the TUI).
+        let (stdout_stdio, stderr_stdio, log_path) =
+            match create_merge_subprocess_log_file(repo_root, loop_id) {
+                Ok((file, path)) => match file.try_clone() {
+                    Ok(file_clone) => (Stdio::from(file_clone), Stdio::from(file), Some(path)),
+                    Err(e) => {
+                        warn!(
+                            loop_id = %loop_id,
+                            error = %e,
+                            "Failed to clone log file handle, subprocess output will be discarded"
+                        );
+                        (Stdio::null(), Stdio::null(), None)
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        loop_id = %loop_id,
+                        error = %e,
+                        "Failed to create subprocess log file, output will be discarded"
+                    );
+                    (Stdio::null(), Stdio::null(), None)
+                }
+            };
+
         match Command::new(ralph_cmd)
             .current_dir(repo_root)
             .args([
@@ -2071,14 +2135,25 @@ fn process_pending_merges_with_command(repo_root: &Path, ralph_cmd: &OsStr) {
                 &format!("Merge loop {} from branch ralph/{}", loop_id, loop_id),
             ])
             .env("RALPH_MERGE_LOOP_ID", loop_id)
+            .stdout(stdout_stdio)
+            .stderr(stderr_stdio)
             .spawn()
         {
             Ok(child) => {
-                info!(
-                    loop_id = %loop_id,
-                    pid = child.id(),
-                    "merge-ralph spawned successfully"
-                );
+                if let Some(path) = log_path {
+                    info!(
+                        loop_id = %loop_id,
+                        pid = child.id(),
+                        log_file = %path.display(),
+                        "merge-ralph spawned successfully"
+                    );
+                } else {
+                    info!(
+                        loop_id = %loop_id,
+                        pid = child.id(),
+                        "merge-ralph spawned successfully"
+                    );
+                }
             }
             Err(e) => {
                 warn!(
@@ -2089,6 +2164,28 @@ fn process_pending_merges_with_command(repo_root: &Path, ralph_cmd: &OsStr) {
             }
         }
     }
+}
+
+/// Creates a timestamped log file for a merge subprocess under `.ralph/diagnostics/logs/`.
+///
+/// Uses the loop_id in the filename for easier identification when debugging.
+/// Participates in the existing log rotation scheme.
+fn create_merge_subprocess_log_file(
+    repo_root: &Path,
+    loop_id: &str,
+) -> std::io::Result<(File, PathBuf)> {
+    use chrono::Local;
+
+    let logs_dir = repo_root.join(".ralph").join("diagnostics").join("logs");
+    fs::create_dir_all(&logs_dir)?;
+
+    let _ = ralph_core::diagnostics::rotate_logs(&logs_dir, 10);
+
+    let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S");
+    let log_path = logs_dir.join(format!("ralph-merge-{}-{}.log", loop_id, timestamp));
+    let file = File::create(&log_path)?;
+
+    Ok((file, log_path))
 }
 
 fn process_pending_merges(repo_root: &Path) {
@@ -2491,6 +2588,80 @@ mod tests {
         process_pending_merges_with_command(repo_root, OsStr::new("ralph"));
 
         assert!(!config_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_process_pending_merges_redirects_subprocess_output_to_log_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp_dir.path();
+
+        // Enqueue a merge entry using the proper API
+        let queue = ralph_core::merge_queue::MergeQueue::new(repo_root);
+        queue.enqueue("test-loop", "merge prompt").expect("enqueue");
+
+        // Create a fake ralph that writes to both stdout and stderr
+        let bin_dir = repo_root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let ralph_path = write_fake_executable(
+            &bin_dir,
+            "ralph",
+            "echo 'stdout output' && echo 'stderr output' >&2 && sleep 0.1",
+        );
+
+        process_pending_merges_with_command(repo_root, ralph_path.as_os_str());
+
+        // Wait for subprocess to finish writing
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Verify a log file was created under .ralph/diagnostics/logs/
+        let logs_dir = repo_root.join(".ralph/diagnostics/logs");
+        assert!(logs_dir.exists(), "diagnostics logs directory should exist");
+
+        let log_files: Vec<_> = std::fs::read_dir(&logs_dir)
+            .expect("read logs dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("ralph-merge-"))
+            .collect();
+        assert!(
+            !log_files.is_empty(),
+            "should have at least one merge subprocess log file"
+        );
+
+        // Verify the log file contains the subprocess output
+        let log_content = std::fs::read_to_string(log_files[0].path()).expect("read log file");
+        assert!(
+            log_content.contains("stdout output"),
+            "log file should contain stdout, got: {log_content}"
+        );
+        assert!(
+            log_content.contains("stderr output"),
+            "log file should contain stderr, got: {log_content}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_process_pending_merges_falls_back_to_null_on_log_creation_failure() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo_root = temp_dir.path();
+
+        // Block log file creation by placing a regular file where the logs directory would be
+        let diagnostics_dir = repo_root.join(".ralph/diagnostics");
+        std::fs::create_dir_all(&diagnostics_dir).expect("diagnostics dir");
+        std::fs::write(diagnostics_dir.join("logs"), "not a directory").expect("block logs dir");
+
+        // Enqueue a merge entry using the proper API
+        let queue = ralph_core::merge_queue::MergeQueue::new(repo_root);
+        queue.enqueue("test-loop", "merge prompt").expect("enqueue");
+
+        // Create a fake ralph
+        let bin_dir = repo_root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let ralph_path = write_fake_executable(&bin_dir, "ralph", "exit 0");
+
+        // Should not panic even though log file creation fails
+        process_pending_merges_with_command(repo_root, ralph_path.as_os_str());
     }
 
     #[test]

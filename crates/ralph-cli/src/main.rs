@@ -1816,12 +1816,24 @@ async fn run_subprocess_tui(
 
     info!(child_args = ?child_args, "Spawning subprocess for TUI mode");
 
-    // Spawn child process
+    // Spawn child process.
+    // Redirect stderr to a log file to prevent child tracing output from
+    // corrupting the TUI display (ratatui runs in raw terminal mode).
+    let stderr_stdio = match ralph_core::diagnostics::create_log_file(
+        &std::env::current_dir().unwrap_or_default(),
+    ) {
+        Ok((file, path)) => {
+            info!(log_file = %path.display(), "TUI subprocess stderr redirected to log file");
+            Stdio::from(file)
+        }
+        Err(_) => Stdio::null(),
+    };
+
     let mut child = Command::new(std::env::current_exe()?)
         .args(&child_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null()) // Suppress — stderr corrupts the parent TUI
+        .stderr(stderr_stdio)
         .spawn()
         .context("Failed to spawn ralph subprocess for TUI")?;
 

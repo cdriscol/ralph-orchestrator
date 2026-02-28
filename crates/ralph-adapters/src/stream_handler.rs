@@ -262,6 +262,7 @@ impl ConsoleStreamHandler {
 impl StreamHandler for ConsoleStreamHandler {
     fn on_text(&mut self, text: &str) {
         let _ = write!(self.stdout, "{}", text);
+        let _ = self.stdout.flush();
         self.last_was_newline = text.ends_with('\n');
     }
 
