@@ -581,7 +581,7 @@ The loop runner accumulates costs across all instances and feeds them into the g
 
 ### 6. Wave Worker Prompt Builder
 
-**New function in:** `crates/ralph-core/src/hatless_ralph.rs` or new file
+**New file:** `crates/ralph-core/src/wave_prompt.rs`
 
 Builds the prompt for a wave worker instance. Simpler than Ralph's full prompt:
 

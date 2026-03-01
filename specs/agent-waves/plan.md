@@ -5,15 +5,14 @@
 - [ ] Step 1: Event model extensions (wave metadata)
 - [ ] Step 2: HatConfig extensions (concurrency, aggregate)
 - [ ] Step 3: WaveTracker state machine
-- [ ] Step 4: Wave CLI tools (`ralph wave start/emit/end`)
+- [ ] Step 4: Wave CLI tool (`ralph wave emit`)
 - [ ] Step 5: Wave worker prompt builder
 - [ ] Step 6: Loop runner wave execution
-- [ ] Step 7: Aggregator gate
-- [ ] Step 8: Context injection for NL dispatch
-- [ ] Step 9: Nested wave prevention
-- [ ] Step 10: Diagnostics and observability
-- [ ] Step 11: Smoke tests and E2E
-- [ ] Step 12: Documentation and example presets
+- [ ] Step 7: Context injection for NL dispatch
+- [ ] Step 8: Nested wave prevention
+- [ ] Step 9: Diagnostics and observability
+- [ ] Step 10: Smoke tests and E2E
+- [ ] Step 11: Documentation and example presets
 
 ---
 
@@ -63,6 +62,8 @@
 
 **Integration notes:** Pure config — no runtime behavior changes. Existing presets are unaffected because defaults preserve current behavior.
 
+**Future failure modes (v2+):** v1 is hardcoded best-effort (continue-on-failure) — partial results are almost always useful, so the wave continues when instances fail and the aggregator gets structured failure metadata. `on_failure: fail_fast` is worth adding in v2 for all-or-nothing use cases (e.g., parallel builds where one failure invalidates everything). Failure thresholds and must-pass hats are better handled by aggregator instructions — the aggregator already sees which instances failed and can decide how to react. If we see patterns where people keep writing the same "abort if X failed" logic in aggregator instructions, that's the signal to promote it to config.
+
 **Demo:** Write a test hat collection YAML with wave config, verify it parses and validates.
 
 ---
@@ -97,35 +98,36 @@
 
 ---
 
-## Step 4: Wave CLI Tools
+## Step 4: Wave CLI Tool
 
-**Objective:** Build the `ralph wave` CLI commands that agents use to dispatch waves from within hat execution.
+**Objective:** Build the `ralph wave emit` command for atomic batch wave dispatch, and enhance `ralph emit` to support wave worker env vars.
 
 **Implementation guidance:**
 - New file: `crates/ralph-cli/src/wave.rs`
 - Add `Wave(wave::WaveArgs)` to `Commands` enum in `crates/ralph-cli/src/main.rs`
 - Wire up `wave::execute()` in the command dispatch match
-- Subcommands:
-  - `ralph wave start --expect N` — generate wave ID (timestamp hex), write `.ralph/wave-state.json`, print wave ID to stdout
-  - `ralph wave end` — validate emitted == expected (warn on mismatch), remove state file
-  - `ralph wave emit <topic> --payloads "a" "b" "c"` — atomic batch: generate wave ID, write N tagged events to JSONL, no state file
+- v1 only supports batch emission — no `start`/`end` subcommands (deferred to v2)
+- `ralph wave emit <topic> --payloads "a" "b" "c"`:
+  1. Check `RALPH_WAVE_WORKER` env var — if set, exit with error (nested wave prevention)
+  2. Generate wave ID (timestamp-based hex: `w-{:08x}` from nanos mod `0xFFFF_FFFF`)
+  3. Resolve events file from `.ralph/current-events` marker (falling back to `.ralph/events.jsonl`)
+  4. Write N events to JSONL, each with `wave_id`, `wave_index: 0..N-1`, `wave_total: N`
+  5. Print wave ID to stdout
 - Enhance existing `ralph emit` (in `main.rs:emit_command`):
-  - Check for `.ralph/wave-state.json`
-  - If present: read wave_id, tag event with `wave_id`, `wave_index`, `wave_total`, increment emitted count
-  - If absent: existing behavior unchanged
-- Wave ID generation: reuse `generate_prompt_id()` pattern with `w-` prefix
+  - Check `RALPH_EVENTS_FILE` env var — if set, write to that file instead of default
+  - Check `RALPH_WAVE_ID` + `RALPH_WAVE_INDEX` env vars — if set, auto-tag events with wave metadata
+  - When no wave env vars are present, behavior is unchanged (backwards compatible)
 
 **Test requirements:**
-- Unit/CLI: `ralph wave start --expect 3` creates state file with correct contents
-- Unit/CLI: `ralph emit` during active wave tags events correctly
-- Unit/CLI: `ralph wave end` removes state file
 - Unit/CLI: `ralph wave emit topic --payloads a b c` writes 3 tagged events atomically
-- Unit/CLI: `ralph emit` without active wave works unchanged
-- Unit/CLI: `ralph wave end` warns when emitted != expected
+- Unit/CLI: `ralph emit` with `RALPH_WAVE_ID` and `RALPH_WAVE_INDEX` env vars tags events correctly
+- Unit/CLI: `ralph emit` with `RALPH_EVENTS_FILE` env var writes to specified file
+- Unit/CLI: `ralph emit` without wave env vars works unchanged
+- Unit/CLI: `RALPH_WAVE_WORKER=1 ralph wave emit` fails with error
 
-**Integration notes:** This is the agent-facing interface. The events file is the handoff — CLI writes tagged JSONL, loop runner reads and detects waves in Step 6.
+**Integration notes:** This is the agent-facing interface. The events file is the handoff — CLI writes tagged JSONL, loop runner reads and detects waves in Step 6. The env var approach keeps `ralph emit` backwards compatible while transparently supporting wave workers.
 
-**Demo:** Run `ralph wave start --expect 2`, `ralph emit review.file "src/main.rs"`, `ralph emit review.file "src/lib.rs"`, `ralph wave end`. Inspect `.ralph/events.jsonl` — two events with matching wave_id, sequential indices, wave_total=2.
+**Demo:** Run `ralph wave emit review.file --payloads "src/main.rs" "src/lib.rs" "src/config.rs"`. Inspect events file — three events with matching wave_id, sequential indices, wave_total=3.
 
 ---
 
@@ -134,15 +136,18 @@
 **Objective:** Build the prompt constructor for wave worker instances — each worker gets focused context with the hat's instructions and its specific event payload.
 
 **Implementation guidance:**
-- New function `build_wave_worker_prompt()` in `crates/ralph-core/src/hatless_ralph.rs` (or new file `wave_prompt.rs`)
-- Input: `HatConfig`, `Event` (the specific wave event), `WaveWorkerContext` (wave_id, index, total, result topics, events file path)
+- New file: `crates/ralph-core/src/wave_prompt.rs`
+- Add `mod wave_prompt` to `crates/ralph-core/src/lib.rs` and export
+- `build_wave_worker_prompt(HatConfig, Event, WaveWorkerContext) -> String`
+- `WaveWorkerContext` contains: `wave_id`, `wave_index`, `wave_total`, `result_topics` (from hat's `publishes`)
 - Prompt sections:
   1. Hat instructions (from config)
   2. Wave context metadata (wave_id, your index, total instances)
   3. Event payload (the work item)
-  4. Event writing guide (how to emit results — topic from `publishes`, include wave_id for correlation)
+  4. Event writing guide (how to emit results — topic from `publishes`, env vars handle correlation transparently)
   5. Nested wave guard ("Do NOT use `ralph wave` commands")
 - Keep it simple — no HATS table, no objective, no scratchpad. Workers are focused executors.
+- The events file path and wave correlation metadata are communicated via env vars (Step 6), not embedded in the prompt. The prompt only includes what the agent needs to understand its task.
 
 **Test requirements:**
 - Unit: prompt includes hat instructions
@@ -159,28 +164,29 @@
 
 ## Step 6: Loop Runner Wave Execution
 
-**Objective:** The core integration — detect wave events after a normal iteration, spawn concurrent backends for wave workers, collect results with timeout management.
+**Objective:** The core integration — detect wave events after a normal iteration, spawn concurrent backends for wave workers, collect results, merge into the main events file, and resume the normal loop. The loop runner owns the entire wave lifecycle; the event loop remains wave-agnostic.
 
 **Implementation guidance:**
 - In `crates/ralph-cli/src/loop_runner.rs`, after `process_events_from_jsonl()`:
-  - New function `detect_wave_events(events)` — groups events by `wave_id`, validates consistency, returns `DetectedWave`
+  - New struct `DetectedWave { wave_id, target_hat: HatId, hat_config: HatConfig, events: Vec<Event>, total: u32 }`
+  - New function `detect_wave_events(events, registry) -> Option<DetectedWave>` — groups events by `wave_id`, validates consistency, resolves target hat from event topic via `HatRegistry`
   - When wave detected, enter wave execution mode:
-    1. Resolve worker hat from event topic (via `HatRegistry`)
-    2. Get `concurrency` limit from worker hat config
-    3. Get `aggregate.timeout` from aggregator hat config (hat that subscribes to worker's `publishes`)
-    4. Register wave in `WaveTracker`
-    5. Spawn concurrent backends using `tokio::sync::Semaphore` for concurrency limiting
-    6. Each backend: set `RALPH_WAVE_WORKER=1` env var, use worker hat's backend config, call `build_wave_worker_prompt()` for the prompt
-    7. Collect results as instances complete — read their events from JSONL, call `wave_tracker.record_result()`
-    8. Handle failures — call `wave_tracker.record_failure()`
-    9. Race against `aggregate.timeout` using `tokio::time::timeout`
-    10. On completion or timeout: cancel remaining instances (SIGTERM/SIGKILL), publish all result events to EventBus
-    11. Record per-instance activation counts and costs
-- Each wave instance needs its own events file (to avoid interleaving with other instances):
-  - Use `.ralph/wave-{wave_id}-{index}-events.jsonl`
-  - Set via `.ralph/current-events` mechanism or pass as `--file` to the backend
-  - Collect and merge results after completion
-  - Clean up per-instance event files
+    1. Create per-worker events files (`.ralph/wave-{wave_id}-{index}.jsonl`)
+    2. Register wave in `WaveTracker`
+    3. Spawn concurrent backends using `tokio::sync::Semaphore` for concurrency limiting
+    4. Each backend gets env vars: `RALPH_WAVE_WORKER=1`, `RALPH_WAVE_ID`, `RALPH_WAVE_INDEX`, `RALPH_EVENTS_FILE` (pointing to per-worker file)
+    5. Each backend uses worker hat's backend config, prompt from `build_wave_worker_prompt()`
+    6. Collect results as instances complete — read events from each per-worker file
+    7. Handle failures — call `wave_tracker.record_failure()`
+    8. Race against aggregate timeout (resolved from downstream aggregator hat's config)
+    9. On timeout: cancel running instances (SIGTERM, then SIGKILL after 250ms)
+    10. Merge all result events from per-worker files into the main events file
+    11. Clean up per-worker files
+    12. Increment worker hat's activation count by number of instances
+    13. Accumulate costs into global `max_cost` check
+  - Resume normal loop — aggregator hat sees all results as pending events on next iteration
+- `WaveInstanceResult { index, status, events, cost, tokens, duration }` — returned by each instance
+- The event loop never sees partial wave results. By the time it processes events on the next iteration, all results have been merged.
 
 **Test requirements:**
 - Integration: mock backend that emits result events, verify wave lifecycle end-to-end
@@ -189,43 +195,16 @@
 - Integration: instance failure, verify wave continues, failure recorded
 - Integration: activation counts incremented per instance
 - Integration: cost accumulated across all instances
+- Integration: per-worker event files created, read, merged, and cleaned up
+- Integration: main events file not written to during wave execution
 
-**Integration notes:** This is the largest and most complex step. It touches the main loop's execution path. The key risk is event file coordination — each wave instance must write to a separate file to avoid JSONL interleaving. Consider implementing this incrementally: first get sequential wave execution working (concurrency=1), then add the semaphore-based concurrency.
+**Integration notes:** This is the largest and most complex step. It touches the main loop's execution path. Consider implementing incrementally: first get sequential wave execution working (concurrency=1), then add the semaphore-based concurrency. The aggregator gate is implicit — by merging all results at once, the event loop's existing `determine_active_hats()` naturally picks up the aggregator hat.
 
 **Demo:** Create a test hat collection with dispatcher + worker (concurrency=2) + aggregator. Run a small wave (3 items) with a mock backend. Verify concurrent execution, result collection, and aggregator activation.
 
 ---
 
-## Step 7: Aggregator Gate
-
-**Objective:** Implement the `wait_for_all` gate that prevents an aggregator hat from activating until all correlated wave results have arrived.
-
-**Implementation guidance:**
-- In `crates/ralph-core/src/event_loop/mod.rs`:
-  - Modify hat activation logic to check aggregate config before activating
-  - When a hat has `aggregate: { mode: wait_for_all }`, check `WaveTracker` for wave completion status
-  - If wave incomplete: hold pending events, don't activate hat
-  - If wave complete (or timed out): activate hat with all results as pending events
-- Format wave results in the pending events section of Ralph's prompt:
-  - Include wave metadata header: `Wave results (wave_id: w-abc, 4/5 complete, 1 failed):`
-  - List each result with index and source
-  - List failures with error info and duration
-- Add `WaveTracker` as a field on `EventLoop`
-
-**Test requirements:**
-- Unit: hat with aggregate config and incomplete wave — not activated
-- Unit: hat with aggregate config and complete wave — activated with all results
-- Unit: hat with aggregate config and timed-out wave — activated with partial results + failure metadata
-- Unit: hat without aggregate config — activated normally (existing behavior)
-- Integration: full cycle — wave results arrive one by one, aggregator only fires once all present
-
-**Integration notes:** Depends on Steps 3 (WaveTracker) and 6 (loop runner populates tracker). The gate check integrates into the existing `next_hat()` / hat activation path.
-
-**Demo:** Run a wave where results arrive incrementally. Verify aggregator doesn't fire early. Verify it fires with all results once complete.
-
----
-
-## Step 8: Context Injection for NL Dispatch
+## Step 7: Context Injection for NL Dispatch
 
 **Objective:** Enhance the HATS table in Ralph's prompt to include downstream hat descriptions and wave dispatch instructions, enabling natural language wave dispatch.
 
@@ -233,7 +212,7 @@
 - In `crates/ralph-core/src/hatless_ralph.rs`, in the HATS table generation (`hats_section`):
   - When the active hat has `publishes` targeting wave-capable hats (`concurrency > 1`):
     - Add "Available Downstream Hats" section with topic, name, description, concurrency
-    - Add wave emission instructions (brief `ralph wave` usage)
+    - Add wave emission instructions (brief `ralph wave emit` usage)
   - When the active hat `publishes` target multiple different hats (scatter-gather):
     - Same enrichment, showing each target hat
 - Use existing `HatInfo` and topology resolution — this already resolves `publishes` → downstream hats
@@ -252,27 +231,26 @@
 
 ---
 
-## Step 9: Nested Wave Prevention
+## Step 8: Nested Wave Prevention
 
 **Objective:** Prevent wave workers from emitting further waves, avoiding complexity explosion in v1.
 
 **Implementation guidance:**
-- **Hard enforcement:** In `ralph wave start` (wave.rs), check `RALPH_WAVE_WORKER` env var. If set, print error and exit with non-zero status.
+- **Hard enforcement:** In `ralph wave emit` (wave.rs), check `RALPH_WAVE_WORKER` env var. If set, print error and exit with non-zero status. (This check is already partially implemented in Step 4, but verify it's in place.)
 - **Soft enforcement:** In `build_wave_worker_prompt()` (Step 5), include "Do NOT use `ralph wave` commands. Nested waves are not supported."
 - The loop runner (Step 6) sets `RALPH_WAVE_WORKER=1` on each wave worker backend process
 
 **Test requirements:**
-- Unit/CLI: `RALPH_WAVE_WORKER=1 ralph wave start --expect 2` exits with error
 - Unit/CLI: `RALPH_WAVE_WORKER=1 ralph wave emit topic --payloads a b` exits with error
 - Unit: wave worker prompt includes nested wave prohibition text
 
-**Integration notes:** Small and self-contained. The env var is already set in Step 6; this step adds the check in the CLI.
+**Integration notes:** Small and self-contained. The env var is already set in Step 6; this step verifies the check in the CLI and prompt.
 
-**Demo:** `RALPH_WAVE_WORKER=1 ralph wave start --expect 2` → error message.
+**Demo:** `RALPH_WAVE_WORKER=1 ralph wave emit topic --payloads a b` → error message.
 
 ---
 
-## Step 10: Diagnostics and Observability
+## Step 9: Diagnostics and Observability
 
 **Objective:** Ensure wave execution is visible in diagnostics, logs, and the TUI.
 
@@ -299,9 +277,11 @@
 
 ---
 
-## Step 11: Smoke Tests and E2E
+## Step 10: Smoke Tests and E2E
 
 **Objective:** Comprehensive test coverage using replay-based smoke tests and E2E framework.
+
+**Note:** If BDD/cucumber acceptance tests land (lifecycle hooks experiment), consider restructuring to write acceptance tests earlier in the implementation sequence — potentially as a first step to drive development.
 
 **Implementation guidance:**
 - **Smoke test fixtures** in `crates/ralph-core/tests/fixtures/`:
@@ -327,7 +307,7 @@
 
 ---
 
-## Step 12: Documentation and Example Presets
+## Step 11: Documentation and Example Presets
 
 **Objective:** Document the wave system for preset authors and provide ready-to-use example presets.
 

@@ -12,7 +12,7 @@
 | `specs/agent-waves/research/worktree-system.md` | Worktree isolation, parallel loop coordination |
 | `specs/agent-waves/research/cli-tools.md` | CLI structure, `ralph emit`, tool documentation |
 | `specs/agent-waves/design.md` | Full design document with architecture, data models, acceptance criteria |
-| `specs/agent-waves/plan.md` | 12-step implementation plan |
+| `specs/agent-waves/plan.md` | 11-step implementation plan |
 | `specs/agent-waves/summary.md` | This file |
 
 ## Overview
@@ -24,7 +24,8 @@ Agent Waves introduce intra-loop parallelism to Ralph's orchestration — fan-ou
 - Ralph dispatches (decides what to parallelize), loop runner executes concurrently
 - Full hat execution per wave instance — agents are smart, let them do the work
 - Ralph as aggregator with `wait_for_all` gate — just another hat activation
-- CLI tools + context injection — same mechanism enables both explicit and NL dispatch
+- CLI tool (`ralph wave emit`) + context injection — same mechanism enables both explicit and NL dispatch
+- Per-worker events files — avoids concurrent write issues, merged by loop runner after collection
 - Shared workspace only for v1 — zero overhead, sufficient for read-heavy workloads
 - Best-effort failure handling — partial results are almost always useful
 - Each instance = one activation — transparent cost accounting
@@ -34,4 +35,4 @@ Agent Waves introduce intra-loop parallelism to Ralph's orchestration — fan-ou
 
 1. **Implement with Ralph:** `ralph run --config presets/pdd-to-code-assist.yml`
 2. **Simpler flow:** `ralph run --config presets/spec-driven.yml`
-3. **Manual implementation:** Follow the 12-step plan in `plan.md`
+3. **Manual implementation:** Follow the 11-step plan in `plan.md`
