@@ -105,6 +105,10 @@ hats:
     backend: "claude"                   # Backend override
     instructions: |
       Hat-specific instructions...
+
+  imported_hat:
+    import: ./shared-hats/builder.yml   # Import from file
+    max_activations: 3                  # Override imported fields
 ```
 
 ## Section Details
@@ -196,6 +200,7 @@ Specialized personas for hat-based mode.
 | `max_activations` | integer | No | Limit activations |
 | `backend` | string | No | Backend override |
 | `instructions` | string | Yes | Hat-specific prompt |
+| `import` | string | No | Path to imported hat file (see [Custom Hats](../advanced/custom-hats.md)) |
 
 ## Example Configurations
 
