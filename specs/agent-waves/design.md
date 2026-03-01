@@ -56,26 +56,41 @@ Source: https://github.com/mikeyobrien/ralph-orchestrator/issues/210
 
 ## Architecture Overview
 
-### Normal vs. Wave Iteration
+### Normal Iteration
 
+```mermaid
+graph TD
+    S1[Hat Selection] --> E1[Ralph executes iteration<br/>wearing hat persona]
+    E1 --> P1[Process events from JSONL]
+    P1 --> N1[Next hat selected<br/>based on pending events]
+    N1 --> S1
 ```
-Normal Iteration                Wave Iteration
-════════════════                ══════════════════════════════════════
 
-Ralph (hat persona)             Ralph (dispatcher persona)
-  │ emit events                   │ emit wave events via CLI tools
-  ▼                               ▼
-Loop runner processes           Loop runner detects wave
-  │                               │
-  ▼                               ├─► Worker 1 (own backend process)
-Ralph (next persona)            ├─► Worker 2 (own backend process)
-                                ├─► Worker 3 (own backend process)
-                                │   (concurrency=3, instances 4-5 queued)
-                                ├─► Worker 4 (slot freed)
-                                └─► Worker 5 (slot freed)
-                                      │
-                                      ▼ all results collected (or timeout)
-                                Ralph (aggregator persona)
+### Wave Iteration
+
+```mermaid
+graph TD
+    S2[Hat Selection] --> E2[Ralph executes iteration<br/>wearing dispatcher persona]
+    E2 --> P2[Process events from JSONL<br/>wave events detected]
+    P2 --> Spawn[Enter wave execution mode]
+
+    Spawn --> W1[Worker 1<br/>own backend]
+    Spawn --> W2[Worker 2<br/>own backend]
+    Spawn --> W3[Worker 3<br/>own backend]
+    Spawn -.->|queued · concurrency=3| W4[Worker 4]
+    Spawn -.-> W5[Worker 5]
+
+    W1 --> Collect[Collect results + failures]
+    W2 --> Collect
+    W3 --> Collect
+    W4 --> Collect
+    W5 --> Collect
+
+    Collect --> Gate{Aggregator gate}
+    Gate -->|all results arrived| Agg[Ralph activates as<br/>aggregator persona]
+    Gate -->|timeout fired| Agg
+
+    Agg --> Next[Resume normal iteration loop]
 ```
 
 ### Wave Lifecycle
