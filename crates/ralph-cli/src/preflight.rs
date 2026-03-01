@@ -237,12 +237,15 @@ pub(crate) async fn load_config_for_preflight(
                 )?;
             }
             HatsSource::Builtin(name) => {
-                // Reject any import: keys in embedded presets
-                if let Some(mapping) = hats_value.as_mapping()
-                    && let Some(hats_mapping) = mapping_get(mapping, "hats")
-                    && let Some(hats_m) = hats_mapping.as_mapping()
+                // Resolve imports from embedded shared hat library
+                let key = Value::String("hats".to_string());
+                if let Some(mapping) = hats_value.as_mapping_mut()
+                    && let Some(Value::Mapping(hats_mapping)) = mapping.get_mut(&key)
                 {
-                    reject_builtin_imports(hats_m)?;
+                    resolve_builtin_hat_imports(
+                        hats_mapping,
+                        &format!("builtin:{name}"),
+                    )?;
                 }
             }
             HatsSource::Remote(_) => {
@@ -651,22 +654,91 @@ fn resolve_hat_imports(hats: &mut Mapping, base_dir: &Path, source_label: &str) 
     Ok(())
 }
 
-/// Checks if any hat in a hats mapping contains an `import:` key.
-/// Used to reject imports in embedded presets which have no filesystem context.
-fn reject_builtin_imports(hats: &Mapping) -> Result<()> {
+/// Resolves `import:` keys in a hats mapping using embedded shared hat files.
+///
+/// Works like [`resolve_hat_imports`] but reads imported hats from the
+/// compiled-in shared hat library instead of the filesystem.
+fn resolve_builtin_hat_imports(hats: &mut Mapping, source_label: &str) -> Result<()> {
     let import_key = Value::String("import".to_string());
-    for (id, def) in hats {
-        if let Some(mapping) = def.as_mapping()
-            && mapping.get(&import_key).is_some()
-        {
-            let hat_id = id.as_str().unwrap_or("<non-string>");
+
+    let hat_ids_with_imports: Vec<Value> = hats
+        .iter()
+        .filter_map(|(id, def)| {
+            def.as_mapping()
+                .and_then(|m| m.get(&import_key))
+                .map(|_| id.clone())
+        })
+        .collect();
+
+    for hat_id in hat_ids_with_imports {
+        let hat_id_str = hat_id.as_str().unwrap_or("<non-string>");
+        let hat_def = hats.get(&hat_id).unwrap().as_mapping().unwrap();
+        let import_value = hat_def.get(&import_key).unwrap();
+
+        let import_path_str = import_value.as_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n\n  \
+                 cause: 'import' must be a string file path"
+            )
+        })?;
+
+        let content =
+            crate::presets::get_shared_hat(import_path_str).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to resolve hat import\n  \
+                     --> {source_label}, hat '{hat_id_str}'\n  \
+                     --> imports {import_path_str}\n\n  \
+                     cause: shared hat not found in embedded library\n  \
+                     hint: embedded presets can only import from presets/shared-hats/"
+                )
+            })?;
+
+        let imported_value: Value = serde_yaml::from_str(content).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n  \
+                 --> imports {import_path_str}\n\n  \
+                 cause: {e}"
+            )
+        })?;
+
+        let imported_mapping = imported_value.as_mapping().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n  \
+                 --> imports {import_path_str}\n\n  \
+                 cause: imported hat file must be a YAML mapping"
+            )
+        })?;
+
+        // Same constraints as filesystem imports
+        if imported_mapping.get(&import_key).is_some() {
             anyhow::bail!(
-                "hat imports are not supported in embedded presets \
-                 — '{hat_id}' contains an 'import:' directive.\n\n\
-                 hint: use a file-based preset to use hat imports"
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n  \
+                 --> imports {import_path_str}\n\n  \
+                 cause: imported hat files cannot contain 'import:' directives \
+                 (transitive imports are not supported)"
             );
         }
+
+        let events_key = Value::String("events".to_string());
+        if imported_mapping.get(&events_key).is_some() {
+            anyhow::bail!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n  \
+                 --> imports {import_path_str}\n\n  \
+                 cause: imported hat files cannot contain 'events:' \
+                 — event metadata belongs in the consuming preset"
+            );
+        }
+
+        let local_overrides = hat_def.clone();
+        let merged = merge_imported_hat(imported_mapping.clone(), &local_overrides);
+        hats.insert(hat_id, Value::Mapping(merged));
     }
+
     Ok(())
 }
 
@@ -1393,25 +1465,81 @@ reviewer:
     }
 
     #[test]
-    fn reject_builtin_imports_catches_import_key() {
-        let hats: Mapping = serde_yaml::from_str(
+    fn resolve_builtin_hat_imports_resolves_shared_hat() {
+        let mut hats: Mapping = serde_yaml::from_str(
             r#"
-builder:
-  import: ./builder.yml
-  name: "Builder"
+committer:
+  import: ./shared-hats/committer.yml
 "#,
         )
         .unwrap();
 
-        let err = reject_builtin_imports(&hats).unwrap_err();
+        resolve_builtin_hat_imports(&mut hats, "builtin:test").unwrap();
+
+        let committer = hats
+            .get(&Value::String("committer".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            committer.get(&Value::String("name".into())),
+            Some(&Value::String("Committer".into()))
+        );
+        // import key should be removed
+        assert!(committer
+            .get(&Value::String("import".into()))
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_builtin_hat_imports_with_overrides() {
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+committer:
+  import: ./shared-hats/committer.yml
+  name: "Custom Committer"
+"#,
+        )
+        .unwrap();
+
+        resolve_builtin_hat_imports(&mut hats, "builtin:test").unwrap();
+
+        let committer = hats
+            .get(&Value::String("committer".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        // Local override wins
+        assert_eq!(
+            committer.get(&Value::String("name".into())),
+            Some(&Value::String("Custom Committer".into()))
+        );
+        // Imported field preserved
+        assert!(committer
+            .get(&Value::String("description".into()))
+            .is_some());
+    }
+
+    #[test]
+    fn resolve_builtin_hat_imports_rejects_unknown_shared_hat() {
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./shared-hats/nonexistent.yml
+"#,
+        )
+        .unwrap();
+
+        let err =
+            resolve_builtin_hat_imports(&mut hats, "builtin:test").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("hat imports are not supported in embedded presets"));
+        assert!(msg.contains("shared hat not found in embedded library"));
         assert!(msg.contains("'builder'"));
     }
 
     #[test]
-    fn reject_builtin_imports_allows_no_imports() {
-        let hats: Mapping = serde_yaml::from_str(
+    fn resolve_builtin_hat_imports_no_op_without_imports() {
+        let mut hats: Mapping = serde_yaml::from_str(
             r#"
 builder:
   name: "Builder"
@@ -1420,7 +1548,7 @@ builder:
         )
         .unwrap();
 
-        assert!(reject_builtin_imports(&hats).is_ok());
+        assert!(resolve_builtin_hat_imports(&mut hats, "builtin:test").is_ok());
     }
 
     #[tokio::test]
@@ -1616,5 +1744,108 @@ hats:
         assert!(mapping_get(mapping, "event_loop").is_some());
         assert!(mapping_get(mapping, "cli").is_none());
         assert!(mapping_get(mapping, "core").is_none());
+    }
+
+    // --- Integration tests: verify builtin presets with imports resolve correctly ---
+
+    #[tokio::test]
+    async fn builtin_feature_resolves_shared_builder() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let core_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(&core_path, "cli:\n  backend: claude\n").unwrap();
+
+        let config = load_config_for_preflight(
+            &[ConfigSource::File(core_path)],
+            Some(&HatsSource::Builtin("feature".to_string())),
+        )
+        .await
+        .unwrap();
+
+        let builder = config.hats.get("builder").expect("builder hat missing");
+        assert_eq!(builder.name, "Builder");
+        assert!(builder.description.as_deref().unwrap().contains("quality gates"));
+        assert!(builder.triggers.contains(&"build.task".to_string()));
+        assert!(builder.publishes.contains(&"build.done".to_string()));
+        assert!(builder.instructions.contains("BUILDER MODE"));
+
+        // reviewer should also be present (inline, not imported)
+        assert!(config.hats.contains_key("reviewer"));
+    }
+
+    #[tokio::test]
+    async fn builtin_code_assist_resolves_shared_builder_and_committer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let core_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(&core_path, "cli:\n  backend: claude\n").unwrap();
+
+        let config = load_config_for_preflight(
+            &[ConfigSource::File(core_path)],
+            Some(&HatsSource::Builtin("code-assist".to_string())),
+        )
+        .await
+        .unwrap();
+
+        // Builder: imported from builder-tdd.yml with name override
+        let builder = config.hats.get("builder").expect("builder hat missing");
+        assert_eq!(builder.name, "⚙️ Builder", "name override should apply");
+        assert!(builder.triggers.contains(&"tasks.ready".to_string()));
+        assert!(builder.triggers.contains(&"validation.failed".to_string()));
+        assert!(builder.instructions.contains("TDD"));
+
+        // Committer: imported from committer.yml with name override
+        let committer = config.hats.get("committer").expect("committer hat missing");
+        assert_eq!(committer.name, "📦 Committer", "name override should apply");
+        assert!(committer.triggers.contains(&"validation.passed".to_string()));
+        assert!(committer.instructions.contains("Conventional Commit"));
+
+        // Validator and planner should be present (inline)
+        assert!(config.hats.contains_key("validator"));
+        assert!(config.hats.contains_key("planner"));
+    }
+
+    #[tokio::test]
+    async fn builtin_pdd_to_code_assist_resolves_with_overrides() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let core_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(&core_path, "cli:\n  backend: claude\n").unwrap();
+
+        let config = load_config_for_preflight(
+            &[ConfigSource::File(core_path)],
+            Some(&HatsSource::Builtin("pdd-to-code-assist".to_string())),
+        )
+        .await
+        .unwrap();
+
+        // Builder: imported with description + instructions overrides
+        let builder = config.hats.get("builder").expect("builder hat missing");
+        assert_eq!(builder.name, "⚙️ Builder");
+        assert!(
+            builder.description.as_deref().unwrap().contains("one code task"),
+            "pdd description override should apply"
+        );
+        assert!(
+            builder.instructions.contains("Storage Layout"),
+            "pdd instructions override should include Storage Layout"
+        );
+        assert!(
+            builder.instructions.contains("Convention Alignment"),
+            "pdd instructions override should include Convention Alignment"
+        );
+        // Should still have the same triggers from the import
+        assert!(builder.triggers.contains(&"tasks.ready".to_string()));
+
+        // Committer: imported with instructions override
+        let committer = config.hats.get("committer").expect("committer hat missing");
+        assert_eq!(committer.name, "📦 Committer");
+        assert!(
+            committer.instructions.contains("pdd-to-code-assist preset"),
+            "pdd committer instructions override should apply"
+        );
+        // Triggers/publishes should come from the import
+        assert!(committer.triggers.contains(&"validation.passed".to_string()));
+        assert!(committer.publishes.contains(&"commit.complete".to_string()));
+
+        // All 9 hats should be present
+        assert_eq!(config.hats.len(), 9, "pdd-to-code-assist should have 9 hats");
     }
 }

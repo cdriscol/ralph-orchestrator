@@ -120,6 +120,38 @@ pub fn preset_names() -> Vec<&'static str> {
     PRESETS.iter().map(|p| p.name).collect()
 }
 
+/// Shared hat files embedded at compile time.
+///
+/// These are standalone hat definitions that presets can reference via
+/// `import: ./shared-hats/<name>.yml`. Keys match the relative path
+/// from the presets directory (e.g., `shared-hats/builder.yml`).
+const SHARED_HATS: &[(&str, &str)] = &[
+    (
+        "shared-hats/builder.yml",
+        include_str!("../presets/shared-hats/builder.yml"),
+    ),
+    (
+        "shared-hats/builder-tdd.yml",
+        include_str!("../presets/shared-hats/builder-tdd.yml"),
+    ),
+    (
+        "shared-hats/committer.yml",
+        include_str!("../presets/shared-hats/committer.yml"),
+    ),
+];
+
+/// Looks up an embedded shared hat by its import path.
+///
+/// The path should be relative to the presets directory, e.g.,
+/// `shared-hats/committer.yml` or `./shared-hats/committer.yml`.
+pub fn get_shared_hat(path: &str) -> Option<&'static str> {
+    let normalized = path.strip_prefix("./").unwrap_or(path);
+    SHARED_HATS
+        .iter()
+        .find(|(key, _)| *key == normalized)
+        .map(|(_, content)| *content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +239,36 @@ mod tests {
         assert!(names.contains(&"merge-loop"));
         assert!(names.contains(&"code-assist"));
         assert!(names.contains(&"fresh-eyes"));
+    }
+
+    #[test]
+    fn test_get_shared_hat_by_path() {
+        let hat = get_shared_hat("shared-hats/committer.yml");
+        assert!(hat.is_some(), "committer shared hat should exist");
+        assert!(hat.unwrap().contains("Committer"));
+    }
+
+    #[test]
+    fn test_get_shared_hat_strips_dot_slash() {
+        let hat = get_shared_hat("./shared-hats/builder.yml");
+        assert!(hat.is_some(), "builder shared hat should resolve with ./ prefix");
+    }
+
+    #[test]
+    fn test_get_shared_hat_returns_none_for_unknown() {
+        assert!(get_shared_hat("shared-hats/nonexistent.yml").is_none());
+    }
+
+    #[test]
+    fn test_all_shared_hats_are_valid_yaml() {
+        for (path, content) in SHARED_HATS {
+            let result: Result<serde_yaml::Value, _> = serde_yaml::from_str(content);
+            assert!(
+                result.is_ok(),
+                "Shared hat '{}' should be valid YAML: {:?}",
+                path,
+                result.err()
+            );
+        }
     }
 }
