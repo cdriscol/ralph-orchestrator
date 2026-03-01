@@ -26,7 +26,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::display::{build_tui_hat_map, print_iteration_separator, print_termination};
+use crate::display::{
+    build_tui_hat_map, print_iteration_separator, print_termination, print_wave_header,
+    print_wave_summary, print_wave_worker_done,
+};
 use crate::process_management;
 use crate::rpc_stdin::{GuidanceMessage, RpcDispatcher, run_stdin_reader, run_stdout_emitter};
 use crate::{ColorMode, Verbosity};
@@ -1412,17 +1415,53 @@ pub async fn run_loop_impl(
                     "Wave detected, executing parallel workers"
                 );
 
+                let show_wave_progress = tui_state.is_none() && !enable_rpc;
+
+                // Compute timeout for header display
+                let wave_timeout_secs = detected
+                    .hat_config
+                    .timeout
+                    .map(u64::from)
+                    .or_else(|| {
+                        detected
+                            .hat_config
+                            .aggregate
+                            .as_ref()
+                            .map(|a| u64::from(a.timeout))
+                    })
+                    .unwrap_or(300);
+
+                if show_wave_progress {
+                    print_wave_header(
+                        &detected.hat_config.name,
+                        detected.total as usize,
+                        wave_timeout_secs,
+                        use_colors,
+                    );
+                }
+
                 let main_events_file = resolve_current_events_path(&ctx);
                 let wave_result = execute_wave(
                     &detected,
                     &backend,
                     &config,
                     &main_events_file,
+                    show_wave_progress,
+                    use_colors,
                 )
                 .await;
 
                 match wave_result {
                     Ok(completed) => {
+                        if show_wave_progress {
+                            print_wave_summary(
+                                completed.results.len(),
+                                completed.failures.len(),
+                                completed.duration,
+                                use_colors,
+                            );
+                        }
+
                         info!(
                             wave_id = %completed.wave_id,
                             results = completed.results.len(),
@@ -2386,6 +2425,8 @@ async fn execute_wave(
     global_backend: &CliBackend,
     _config: &RalphConfig,
     main_events_file: &Path,
+    show_progress: bool,
+    use_colors: bool,
 ) -> Result<ralph_core::CompletedWave> {
     use ralph_core::{WaveTracker, WaveWorkerContext, build_wave_worker_prompt};
 
@@ -2397,12 +2438,12 @@ async fn execute_wave(
     let timeout_secs = wave
         .hat_config
         .timeout
-        .map(|t| t as u64)
+        .map(u64::from)
         .or_else(|| {
             wave.hat_config
                 .aggregate
                 .as_ref()
-                .map(|a| a.timeout as u64)
+                .map(|a| u64::from(a.timeout))
         })
         .unwrap_or(300);
     let wave_timeout = Duration::from_secs(timeout_secs);
@@ -2421,6 +2462,22 @@ async fn execute_wave(
         .parent()
         .unwrap_or(Path::new(".ralph"))
         .to_path_buf();
+
+    // Build payload previews for display (first ~60 chars of each event payload)
+    let payload_previews: Vec<String> = wave
+        .events
+        .iter()
+        .map(|e| {
+            e.payload
+                .clone()
+                .unwrap_or_default()
+                .replace('\n', " ")
+        })
+        .collect();
+
+    // Channel for real-time per-worker progress reporting
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(u32, bool, Duration)>();
 
     // Spawn workers
     let mut handles = Vec::new();
@@ -2468,6 +2525,7 @@ async fn execute_wave(
 
         let worker_timeout = Some(wave_timeout);
         let worker_events_path = worker_events_file.clone();
+        let tx = progress_tx.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = permit; // Hold permit for concurrency limiting
@@ -2489,13 +2547,16 @@ async fn execute_wave(
 
                     if exec_result.timed_out && events.is_empty() {
                         // Worker timed out without emitting events — record as failure
+                        let _ = tx.send((index, false, duration));
                         (index, Err((format!("Worker timed out after {}s without emitting events", wave_timeout.as_secs()), duration)))
                     } else {
+                        let _ = tx.send((index, true, duration));
                         (index, Ok((events, duration, exec_result.success)))
                     }
                 }
                 Err(e) => {
                     let _ = fs::remove_file(&worker_events_path);
+                    let _ = tx.send((index, false, duration));
                     (index, Err((e.to_string(), duration)))
                 }
             }
@@ -2504,8 +2565,36 @@ async fn execute_wave(
         handles.push(handle);
     }
 
+    // Drop our sender so the receiver terminates when all workers finish
+    drop(progress_tx);
+
+    // Spawn a task to print real-time progress
+    let total = wave.total;
+    let previews = payload_previews.clone();
+    let progress_handle = if show_progress {
+        Some(tokio::spawn(async move {
+            while let Some((index, success, duration)) = progress_rx.recv().await {
+                let preview = previews
+                    .get(index as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                print_wave_worker_done(index, total, duration, success, preview, use_colors);
+            }
+        }))
+    } else {
+        // Drain the channel without printing
+        Some(tokio::spawn(async move {
+            while progress_rx.recv().await.is_some() {}
+        }))
+    };
+
     // Collect results
     let results = futures::future::join_all(handles).await;
+
+    // Wait for progress printer to finish
+    if let Some(handle) = progress_handle {
+        let _ = handle.await;
+    }
 
     for result in results {
         match result {
