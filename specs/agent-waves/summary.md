@@ -26,10 +26,20 @@ Agent Waves introduce intra-loop parallelism to Ralph's orchestration — fan-ou
 - Ralph as aggregator with `wait_for_all` gate — just another hat activation
 - CLI tool (`ralph wave emit`) + context injection — same mechanism enables both explicit and NL dispatch
 - Per-worker events files — avoids concurrent write issues, merged by loop runner after collection
-- Shared workspace only for v1 — zero overhead, sufficient for read-heavy workloads
+- Shared workspace only — waves are for lightweight intra-loop parallelism; write-heavy work uses parallel loops instead (worktree isolation for waves removed from v2 scope)
 - Best-effort failure handling — partial results are almost always useful
 - Each instance = one activation — transparent cost accounting
 - 300s default aggregation timeout — prevents hung waves
+
+## Relationship to Parallel Loops
+
+Waves and parallel loops are complementary, not overlapping. Parallel loops (user-initiated, full orchestration in git worktrees) handle independent write-heavy tasks. Waves (Ralph-initiated, targeted hat activations in shared workspace) handle intra-loop fan-out. Key differences: who initiates (user vs Ralph), what runs (full hat sequence vs specific hat), isolation (worktree vs shared), and completion (merge queue vs aggregator). The two compose — a parallel loop can use waves internally.
+
+## Example Patterns
+
+The design includes two detailed example configurations:
+- **Scatter-gather code review** — dispatcher fans out to 4 specialized reviewers (security, performance, architecture, correctness), synthesizer aggregates findings into a unified review
+- **Multi-round moderator-debater** — moderator runs up to 3 rounds of structured debate with dynamic participant selection per round, using `max_activations` as the rounds knob
 
 ## Next Steps
 

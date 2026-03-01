@@ -309,20 +309,32 @@
 
 ## Step 11: Documentation and Example Presets
 
-**Objective:** Document the wave system for preset authors and provide ready-to-use example presets.
+**Objective:** Document the wave system for preset authors and ship ready-to-use presets that demonstrate the key wave patterns.
 
 **Implementation guidance:**
 - **Update `crates/ralph-core/data/ralph-tools.md`:** Add `ralph wave` command reference (required per CLAUDE.md)
-- **Example presets** in `presets/`:
-  - `wave-research.yml` — parallel deep research with synthesis (NL dispatch)
-  - `wave-review.yml` — multi-perspective code review with moderator (explicit dispatch)
 - **Update CLAUDE.md:** Add wave section to architecture overview, mention `concurrency` and `aggregate` config
 - **Document failure behavior:** How best-effort works, what the aggregator receives on partial failure/timeout, how to write aggregator instructions that handle missing results
+- **Ship presets** in `presets/`:
+
+  **Splitter pattern:**
+  - `wave-research.yml` — parallel deep research with synthesis (NL dispatch). Planner identifies topics → researchers investigate in parallel → synthesizer combines findings.
+
+  **Scatter-gather pattern:**
+  - `wave-review.yml` — specialized parallel code review. Dispatcher reads diff → fan out to security/performance/architecture/correctness reviewers → synthesizer produces unified review.
+
+  **Multi-round debate pattern:**
+  - `wave-debate.yml` — moderator-debater with dynamic participant selection. Moderator dispatches to domain-specific debaters, aggregates responses, selectively re-dispatches based on unresolved disagreements. Uses `max_activations` to cap rounds.
+
+  **Multi-phase pipeline:**
+  - `wave-review-and-document.yml` — reviews branch changes vs main and writes documentation updates. Change analyzer → parallel specialized reviewers → doc planner → parallel doc writers (one per file) → doc reviewer with approve/revise decision loop. Demonstrates chaining multiple wave fan-outs in a single workflow with a decision-point aggregator.
+
+  Each preset should be repo-agnostic where possible (referencing `git diff main...HEAD` rather than hardcoded paths) with comments indicating what to customize for specific repos.
 
 **Test requirements:**
-- Example presets parse and validate: `cargo test` covers config validation
+- All presets parse and validate: `cargo test` covers config validation
 - Tool documentation is accurate: manual review
 
-**Integration notes:** Documentation step. Presets serve as both documentation and starting points for users.
+**Integration notes:** Documentation step. Presets serve as both documentation and starting points — users should be able to copy a preset and adapt it to their domain by changing reviewer specialties, doc paths, and concurrency limits.
 
 **Demo:** `ralph run --config presets/wave-research.yml --dry-run` (or similar) validates the preset loads correctly.

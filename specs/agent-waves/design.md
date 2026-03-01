@@ -843,6 +843,207 @@ If all instances fail or timeout:
 
 ---
 
+## Relationship to Parallel Loops
+
+Ralph has an existing parallel loops feature that runs independent orchestration loops in git worktrees. Waves and parallel loops are complementary, not overlapping — they solve different problems at different granularities.
+
+| Dimension | Parallel Loops (existing) | Agent Waves |
+|-----------|--------------------------|-------------|
+| **Granularity** | Entire orchestration runs | Single hat activations within a run |
+| **Initiated by** | User (CLI: `ralph run -p "..."`) | Ralph (NL dispatch / `ralph wave emit`) |
+| **What runs** | Full hat sequence (Ralph picks hats) | Specific hat with specific payload |
+| **Isolation** | Always git worktree (separate branch) | Shared workspace |
+| **On completion** | Merge queue → merge-ralph | Aggregator hat fires when all results arrive |
+| **Lifecycle** | Minutes to hours | Seconds to minutes |
+| **Configuration** | `features.parallel: true` (orchestrator-level) | `concurrency` / `aggregate` (hat-level) |
+
+### Why not combine them?
+
+Worktree isolation in parallel loops is load-bearing — independent orchestration runs write to overlapping files, run conflicting builds, and need separate git branches. Removing worktrees would introduce concurrent write races with no coordination mechanism.
+
+Waves fill the lightweight case: intra-loop fan-out where instances are read-heavy or write-disjoint. The dispatcher controls what each worker sees, and shared workspace has zero overhead.
+
+A "parallel loops without worktrees" option would give the danger of shared-workspace concurrent writes without the guardrails waves provide (targeted single-hat activations, aggregation, Ralph deciding what's safe to parallelize).
+
+### Wave v2 worktree isolation is unnecessary
+
+The original design deferred worktree isolation for wave instances to v2. However, if a wave instance needs full filesystem and branch isolation, that's the parallel loops use case — use parallel loops instead. Waves are for the lightweight case where isolation isn't needed. Two sharp tools instead of one blurry one.
+
+The two features compose: a worktree parallel loop can internally use waves for subtask parallelism within its own orchestration run.
+
+---
+
+## Example Configurations
+
+### Scatter-Gather: Specialized Code Review
+
+Four specialized reviewers run concurrently, each examining the PR from a different angle. The dispatcher tailors context per reviewer so each gets only relevant files. The synthesizer waits for all findings before producing a unified review.
+
+Note: `concurrency: 1` on each reviewer doesn't mean sequential — different hats run concurrently by default in wave mode. The `concurrency` field controls instances of the *same* hat. Four hats with `concurrency: 1` = four parallel workers.
+
+```yaml
+hats:
+  review-dispatcher:
+    name: "Review Dispatcher"
+    description: "Reads the PR diff and dispatches to specialized reviewers"
+    triggers: ["review.start"]
+    publishes: ["review.security", "review.perf", "review.arch", "review.correctness"]
+    instructions: |
+      Read the PR diff. For each reviewer, emit an event with ONLY the
+      files and context relevant to their specialty. Don't send everything
+      to everyone — tailor the payload.
+
+  security-reviewer:
+    name: "Security Reviewer"
+    description: "Reviews code for security vulnerabilities"
+    triggers: ["review.security"]
+    publishes: ["review.finding"]
+    concurrency: 1
+    instructions: |
+      ONLY look for: injection, auth flaws, secrets in code, unsafe
+      deserialization, OWASP top 10. Ignore style and performance.
+
+  perf-reviewer:
+    name: "Performance Reviewer"
+    description: "Reviews code for performance issues"
+    triggers: ["review.perf"]
+    publishes: ["review.finding"]
+    concurrency: 1
+    instructions: |
+      ONLY look for: N+1 queries, unbounded allocations, hot path
+      inefficiencies, missing indexes, unnecessary clones/copies.
+
+  arch-reviewer:
+    name: "Architecture Reviewer"
+    description: "Reviews code for architectural concerns"
+    triggers: ["review.arch"]
+    publishes: ["review.finding"]
+    concurrency: 1
+    instructions: |
+      ONLY look for: coupling, abstraction leaks, violation of existing
+      patterns, module boundary crossings, dependency direction.
+
+  correctness-reviewer:
+    name: "Correctness Reviewer"
+    description: "Reviews code for logic errors and edge cases"
+    triggers: ["review.correctness"]
+    publishes: ["review.finding"]
+    concurrency: 1
+    instructions: |
+      ONLY look for: logic errors, edge cases, off-by-ones, error
+      handling gaps, race conditions, missing null checks.
+
+  review-synthesizer:
+    name: "Review Synthesizer"
+    description: "Combines findings from all reviewers into a unified review"
+    triggers: ["review.finding"]
+    publishes: ["review.complete"]
+    aggregate:
+      mode: wait_for_all
+      timeout: 300
+    instructions: |
+      You have findings from 4 specialized reviewers. Deduplicate where
+      reviewers flagged the same issue. Rank by severity. Output a single
+      unified review with actionable line-level comments.
+```
+
+### Multi-Round Debate: Moderator with Dynamic Participant Selection
+
+A moderator runs up to 3 rounds of structured debate. Each round, the moderator selects which debaters participate based on unresolved disagreements from prior rounds. The moderator controls participation by choosing which events to emit — no special config needed.
+
+Key mechanisms:
+- **`max_activations: 4`** is the rounds knob: activation 1 = initial dispatch, activations 2-4 = debate rounds. The moderator is structurally forced to conclude by activation 4.
+- **Dynamic selection** is just "which events you emit." Round 1 the moderator emits all 4 debate topics. Round 2 it might only emit `debate.security` and `debate.arch` because the other concerns were resolved.
+- **Prior context flows through payloads.** Round 2's payload includes round 1's responses, so debaters can argue with each other.
+
+```yaml
+hats:
+  moderator:
+    name: "Debate Moderator"
+    description: "Runs multi-round structured debate with dynamic participant selection"
+    triggers: ["debate.start", "debate.response"]
+    publishes: ["debate.security", "debate.perf", "debate.arch", "debate.ux", "debate.final"]
+    max_activations: 4    # 1 initial dispatch + 3 debate rounds
+    aggregate:
+      mode: wait_for_all
+      timeout: 300
+    instructions: |
+      You are a debate moderator. You run up to 3 rounds of debate.
+
+      ROUND 1 (first activation, triggered by debate.start):
+        Dispatch the topic to ALL debaters. Include the full context.
+
+      ROUNDS 2-3 (subsequent activations, triggered by debate.response):
+        Review all responses. Identify:
+        - Points of disagreement between debaters
+        - Claims that need deeper investigation
+        - Perspectives that are missing
+
+        Then SELECTIVELY re-dispatch: only emit events for debaters whose
+        expertise is relevant to the unresolved points. Pass prior round
+        context in the payload so debaters can respond to each other.
+
+        If consensus reached early, skip remaining rounds and emit debate.final.
+
+      FINAL ACTIVATION (activation 4, or earlier if done):
+        Synthesize all rounds into a final verdict. Emit debate.final.
+
+  security-debater:
+    name: "Security Debater"
+    description: "Argues the security perspective in structured debates"
+    triggers: ["debate.security"]
+    publishes: ["debate.response"]
+    concurrency: 1
+    instructions: |
+      You are the security perspective. Argue your position based on
+      security best practices. If responding to a prior round, directly
+      address counterarguments from other debaters.
+
+  perf-debater:
+    name: "Performance Debater"
+    description: "Argues the performance perspective in structured debates"
+    triggers: ["debate.perf"]
+    publishes: ["debate.response"]
+    concurrency: 1
+    instructions: |
+      You are the performance perspective. Argue based on runtime cost,
+      scalability, and resource efficiency. Acknowledge valid tradeoffs
+      raised by other debaters.
+
+  arch-debater:
+    name: "Architecture Debater"
+    description: "Argues the architecture perspective in structured debates"
+    triggers: ["debate.arch"]
+    publishes: ["debate.response"]
+    concurrency: 1
+    instructions: |
+      You are the architecture perspective. Argue based on maintainability,
+      separation of concerns, and long-term evolution of the codebase.
+
+  ux-debater:
+    name: "UX Debater"
+    description: "Argues the user experience perspective in structured debates"
+    triggers: ["debate.ux"]
+    publishes: ["debate.response"]
+    concurrency: 1
+    instructions: |
+      You are the user experience perspective. Argue based on developer
+      ergonomics, API clarity, and end-user impact.
+```
+
+### Global Concurrency Limit (Not Yet Specified)
+
+The examples above assume a global concurrency limit of 4. Per-hat `concurrency` controls instances of the same hat, but there is no global cap across all concurrent wave workers. A future addition:
+
+```yaml
+features:
+  max_concurrency: 4    # cap total concurrent wave workers across all hats
+```
+
+Without this, a dispatcher fanning out to 4 hats each with `concurrency: 3` could spawn 12 concurrent backends. The global semaphore would be a simple addition to the loop runner alongside the existing per-hat semaphore.
+
+---
+
 ## Acceptance Criteria
 
 ### Wave Dispatch
@@ -1027,7 +1228,7 @@ Key findings from codebase research (full details in `research/` directory):
 ### D. Future Extensions (v2+)
 
 - **Incremental wave emission**: `ralph wave start`/`ralph wave end` for dynamic wave sizing (when the dispatcher doesn't know the count upfront)
-- **Worktree isolation**: `isolation: worktree` for write-heavy waves, using existing `create_worktree()` infrastructure
+- ~~**Worktree isolation**~~: Removed — write-heavy parallel work should use parallel loops instead. See "Relationship to Parallel Loops" section
 - **Nested waves**: wave workers emitting sub-waves for hierarchical decomposition
 - **Additional aggregation modes**: `first_n` (activate after N results), `quorum` (majority), `external_event` (wait for external signal)
 - **Configurable failure modes**: `on_failure: fail_fast | best_effort`
