@@ -30,7 +30,8 @@ event_loop:
   checkpoint_interval: 5
 
 cli:
-  backend: "claude"
+  backend: "kiro"
+  prompt_mode: "arg"
 
 core:
   specs_dir: ".ralph/specs/"

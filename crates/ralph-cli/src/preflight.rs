@@ -242,7 +242,7 @@ pub(crate) async fn load_config_for_preflight(
                     && let Some(hats_mapping) = mapping_get(mapping, "hats")
                     && let Some(hats_m) = hats_mapping.as_mapping()
                 {
-                    reject_builtin_imports(hats_m, name)?;
+                    reject_builtin_imports(hats_m)?;
                 }
             }
             HatsSource::Remote(_) => {
@@ -653,7 +653,7 @@ fn resolve_hat_imports(hats: &mut Mapping, base_dir: &Path, source_label: &str) 
 
 /// Checks if any hat in a hats mapping contains an `import:` key.
 /// Used to reject imports in embedded presets which have no filesystem context.
-fn reject_builtin_imports(hats: &Mapping, _preset_name: &str) -> Result<()> {
+fn reject_builtin_imports(hats: &Mapping) -> Result<()> {
     let import_key = Value::String("import".to_string());
     for (id, def) in hats {
         if let Some(mapping) = def.as_mapping()
@@ -1186,6 +1186,26 @@ builder:
     }
 
     #[test]
+    fn resolve_hat_imports_invalid_yaml_in_imported_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("bad.yml"), "{{: not valid yaml [").unwrap();
+
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./bad.yml
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_hat_imports(&mut hats, temp_dir.path(), "test.yml").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("failed to resolve hat import"));
+        assert!(msg.contains("hat 'builder'"));
+        assert!(msg.contains("bad.yml"));
+    }
+
+    #[test]
     fn resolve_hat_imports_non_string_import_path() {
         let mut hats: Mapping = serde_yaml::from_str(
             r#"
@@ -1383,7 +1403,7 @@ builder:
         )
         .unwrap();
 
-        let err = reject_builtin_imports(&hats, "feature").unwrap_err();
+        let err = reject_builtin_imports(&hats).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("hat imports are not supported in embedded presets"));
         assert!(msg.contains("'builder'"));
@@ -1400,7 +1420,7 @@ builder:
         )
         .unwrap();
 
-        assert!(reject_builtin_imports(&hats, "feature").is_ok());
+        assert!(reject_builtin_imports(&hats).is_ok());
     }
 
     #[tokio::test]
