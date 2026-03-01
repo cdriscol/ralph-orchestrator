@@ -15,6 +15,18 @@ Source: https://github.com/mikeyobrien/ralph-orchestrator/issues/210
 
 ---
 
+## Architectural Impact
+
+Today, `next_hat()` always returns "ralph" in multi-hat mode. Custom hats never get their own backend process — they are personas that Ralph wears during coordination. Wave workers are the **first case where hats execute directly** with their own backend process, outside Ralph's coordination context.
+
+This is a deliberate, bounded exception to the Hatless Ralph model:
+
+- **Why it's safe**: Wave workers have no coordination role. They receive a single task payload, execute with their hat's instructions, emit a result event, and exit. They cannot emit waves (hard-blocked via env var), have no access to Ralph's HATS table, scratchpad, or objective, and cannot influence hat selection.
+- **What's preserved**: Ralph still owns all coordination — hat selection, event routing, aggregation, and loop control. The loop runner manages the wave lifecycle entirely; the event loop remains wave-agnostic.
+- **Bounded scope**: Workers are structurally isolated. Each gets a per-worker events file, a fresh backend process, and env vars that identify it as a wave worker. The loop runner collects results and merges them back into the main event stream only after the wave completes.
+
+---
+
 ## Detailed Requirements
 
 ### Core Architecture (from requirements clarification)
@@ -33,17 +45,20 @@ Source: https://github.com/mikeyobrien/ralph-orchestrator/issues/210
 ### v1 Scope
 
 **Included:**
-- Wave CLI tools (`ralph wave start/emit/end`)
+- Wave CLI tool (`ralph wave emit` — atomic batch emission)
 - Event correlation metadata (`wave_id`, `wave_index`, `wave_total`)
 - Concurrent backend spawning in loop runner (respecting `concurrency` limit)
 - `aggregate.mode: wait_for_all` with configurable timeout (default 300s)
 - Context injection (downstream hat descriptions in prompt for NL dispatch)
 - Best-effort failure handling with structured failure metadata
 - Per-instance activation and cost accounting
-- Shared workspace (no isolation)
+- Per-worker events files (merged by loop runner after collection)
+- Worker env var injection (`RALPH_WAVE_WORKER`, `RALPH_WAVE_ID`, `RALPH_WAVE_INDEX`, `RALPH_EVENTS_FILE`)
+- Shared workspace (no filesystem isolation)
 - No nested waves
 
 **Deferred to v2+:**
+- `ralph wave start`/`ralph wave end` (incremental wave emission)
 - Worktree isolation (`isolation: worktree`)
 - Nested waves
 - Additional aggregation modes (`first_n`, `quorum`, `external_event`)
@@ -86,9 +101,8 @@ graph TD
     W4 --> Collect
     W5 --> Collect
 
-    Collect --> Gate{Aggregator gate}
-    Gate -->|all results arrived| Agg[Ralph activates as<br/>aggregator persona]
-    Gate -->|timeout fired| Agg
+    Collect --> Merge[Loop runner merges results<br/>into main events file]
+    Merge --> Agg[Ralph activates as<br/>aggregator persona]
 
     Agg --> Next[Resume normal iteration loop]
 ```
@@ -115,12 +129,13 @@ sequenceDiagram
         LR->>W3: Spawn backend with hat instructions + payload[2]
     end
 
-    W1->>LR: Result event (wave_id=w-abc, index=0)
-    W3->>LR: Result event (wave_id=w-abc, index=2)
-    W2->>LR: Result event (wave_id=w-abc, index=1)
+    Note over W1,W3: Each worker writes to its own events file
+    W1->>LR: Completes (result in wave-w-abc-0.jsonl)
+    W3->>LR: Completes (result in wave-w-abc-2.jsonl)
+    W2->>LR: Completes (result in wave-w-abc-1.jsonl)
 
-    LR->>LR: All 3/3 results received, open aggregator gate
-    LR->>RA: Activate with all results as pending events
+    LR->>LR: All 3/3 complete, merge results into main events file
+    LR->>RA: Normal iteration — all results appear as pending events
     RA->>LR: Aggregated output event
 ```
 
@@ -133,8 +148,7 @@ graph TB
     end
 
     subgraph "CLI Layer"
-        WS[ralph wave start]
-        WE[ralph wave end]
+        WBE[ralph wave emit]
         RE[ralph emit]
     end
 
@@ -160,8 +174,7 @@ graph TB
     end
 
     HC --> LR
-    WS --> EM
-    WE --> EM
+    WBE --> EM
     RE --> EM
     EM --> ER
     ER --> LR
@@ -231,7 +244,7 @@ pub struct EventRecord {
 
 **File:** `crates/ralph-core/src/event_reader.rs`
 
-Update the JSONL deserializer to parse wave fields. Use `#[serde(default)]` so existing events without wave fields parse correctly.
+Update the JSONL deserializer to parse wave fields. Use `#[serde(default)]` so existing events without wave fields parse correctly. The existing `deserialize_flexible_payload` function handles string/object/null payloads — no changes needed there, but the `Event` struct in `event_reader.rs` (distinct from `ralph-proto`'s `Event`) must gain the optional wave fields.
 
 ### 2. HatConfig Extensions
 
@@ -370,7 +383,7 @@ pub enum WaveProgress {
 }
 ```
 
-### 4. Wave CLI Tools
+### 4. Wave CLI Tool
 
 **New file:** `crates/ralph-cli/src/wave.rs`
 
@@ -385,23 +398,9 @@ pub struct WaveArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum WaveCommands {
-    /// Start a new wave. Returns a wave ID.
-    Start(WaveStartArgs),
-    /// End the current wave. Finalizes expected count.
-    End(WaveEndArgs),
-    /// Batch emit: start wave, emit N events, end wave — all in one command.
+    /// Batch emit: generate wave ID, emit N events atomically.
     Emit(WaveBatchEmitArgs),
 }
-
-#[derive(Parser, Debug)]
-pub struct WaveStartArgs {
-    /// Expected number of wave events.
-    #[arg(long)]
-    pub expect: u32,
-}
-
-#[derive(Parser, Debug)]
-pub struct WaveEndArgs {}
 
 #[derive(Parser, Debug)]
 pub struct WaveBatchEmitArgs {
@@ -413,48 +412,45 @@ pub struct WaveBatchEmitArgs {
 }
 ```
 
-**Wave state file:** `.ralph/wave-state.json`
+**`ralph wave emit <topic> --payloads "a" "b" "c"`:**
+Atomic batch emission — no state file needed:
+1. Check `RALPH_WAVE_WORKER` env var — if set, exit with error (nested wave prevention)
+2. Generate wave ID (timestamp-based hex: `w-{:08x}` from nanos mod `0xFFFF_FFFF`)
+3. Resolve events file from `.ralph/current-events` marker (falling back to `.ralph/events.jsonl`)
+4. Write N events to JSONL, each with `wave_id`, `wave_index: 0..N-1`, `wave_total: N`
+5. Print wave ID to stdout
 
-During a wave emission sequence (`start` → multiple `emit` → `end`), the CLI tracks state in a temporary file:
+v1 only supports batch emission. Incremental emission (`ralph wave start`/`ralph wave end`) is deferred to v2 — the batch command covers the common case and avoids state file complexity.
 
-```json
-{
-  "wave_id": "w-a3f7b2c1",
-  "expected": 5,
-  "emitted": 3,
-  "started_at": "2026-02-28T10:00:00Z"
+**`ralph emit` (unchanged):**
+No modifications to `ralph emit` in v1. When a wave worker needs to emit result events, the worker's env vars (`RALPH_WAVE_ID`, `RALPH_WAVE_INDEX`) are read by `ralph emit` to auto-tag the event with wave correlation metadata. The worker's `RALPH_EVENTS_FILE` env var directs output to its per-worker events file.
+
+```rust
+// In emit_command():
+fn resolve_wave_metadata() -> Option<(String, u32)> {
+    let wave_id = std::env::var("RALPH_WAVE_ID").ok()?;
+    let wave_index = std::env::var("RALPH_WAVE_INDEX").ok()?.parse().ok()?;
+    Some((wave_id, wave_index))
+}
+
+fn resolve_events_file(args: &EmitArgs) -> PathBuf {
+    // 1. RALPH_EVENTS_FILE env var (set for wave workers)
+    // 2. .ralph/current-events marker (existing behavior)
+    // 3. args.file fallback (existing behavior)
+    if let Ok(path) = std::env::var("RALPH_EVENTS_FILE") {
+        return PathBuf::from(path);
+    }
+    // ... existing resolution logic ...
 }
 ```
 
-**`ralph wave start --expect N`:**
-1. Generate wave ID (timestamp-based hex, matching existing `generate_prompt_id()` pattern)
-2. Write wave state file
-3. Print wave ID to stdout (agent captures it)
-
-**`ralph emit` (during active wave):**
-Enhanced to detect active wave state file. When present:
-1. Read wave state, get `wave_id` and current `emitted` count
-2. Tag the event with `wave_id`, `wave_index: emitted`, `wave_total: expected`
-3. Increment `emitted` count in state file
-4. Write event to JSONL as normal
-
-When no wave state file exists, `ralph emit` works exactly as today (backwards compatible).
-
-**`ralph wave end`:**
-1. Validate `emitted == expected` (warn if mismatch, adjust `wave_total` on already-emitted events if needed)
-2. Remove wave state file
-
-**`ralph wave emit <topic> --payloads "a" "b" "c"`:**
-Convenience command that does start + N emits + end atomically:
-1. Generate wave ID
-2. Write N events to JSONL, each with `wave_id`, `wave_index: 0..N-1`, `wave_total: N`
-3. No state file needed (atomic operation)
+When wave metadata is present, the emitted event includes `wave_id` and `wave_index` fields. `wave_total` is omitted on worker result events (the loop runner already knows the expected total from the dispatch events).
 
 ### 5. Loop Runner Changes
 
 **File:** `crates/ralph-cli/src/loop_runner.rs`
 
-The main loop gains a new execution path after processing events from a normal iteration:
+The main loop gains a new execution phase after processing events from a normal iteration. The loop runner **owns the entire wave lifecycle** — the event loop remains wave-agnostic.
 
 ```
 Main loop iteration:
@@ -465,19 +461,35 @@ Main loop iteration:
   5. Read events from JSONL
   6. *** NEW: Detect wave events ***
   7. If wave events detected:
-     a. Enter wave execution mode
-     b. Spawn concurrent backends (up to concurrency limit)
-     c. Collect results (with timeout)
-     d. Route results to EventBus
-     e. Check aggregator gate
-  8. Continue normal loop (aggregator activates next if gate open)
+     a. Separate wave events from non-wave events
+     b. Resolve target hat from wave event topics (via hat registry)
+     c. Create per-worker events files (.ralph/wave-{wave_id}-{index}.jsonl)
+     d. Spawn concurrent backends (up to concurrency limit)
+     e. Collect results with aggregate timeout
+     f. Read result events from each per-worker events file
+     g. Merge all results into the main events file
+     h. Clean up per-worker files
+     i. Increment worker hat's activation count by number of instances
+  8. Continue normal loop (aggregator hat sees all results as pending events)
 ```
 
 **Wave detection** (after `process_events_from_jsonl()`):
 ```rust
-fn detect_wave_events(events: &[Event]) -> Option<DetectedWave> {
+pub struct DetectedWave {
+    pub wave_id: String,
+    pub target_hat: HatId,           // resolved from topic → hat mapping
+    pub hat_config: HatConfig,       // the worker hat's config
+    pub events: Vec<Event>,          // the individual wave events
+    pub total: u32,                  // expected total (from wave_total field)
+}
+
+fn detect_wave_events(
+    events: &[Event],
+    registry: &HatRegistry,
+) -> Option<DetectedWave> {
     // Group events by wave_id
     // Validate: all events in a wave_id have consistent wave_total
+    // Resolve target hat from event topic via registry
     // Return wave metadata + events
 }
 ```
@@ -487,39 +499,85 @@ fn detect_wave_events(events: &[Event]) -> Option<DetectedWave> {
 async fn execute_wave(
     &mut self,
     wave: DetectedWave,
-    hat_config: &HatConfig,
     backend: &CliBackend,
-) -> Result<Vec<WaveInstanceResult>> {
-    let semaphore = Arc::new(Semaphore::new(hat_config.concurrency as usize));
+) -> Result<CompletedWave> {
+    let semaphore = Arc::new(Semaphore::new(wave.hat_config.concurrency as usize));
     let mut handles = Vec::new();
 
-    for instance in wave.events {
+    for (index, event) in wave.events.iter().enumerate() {
+        // Create per-worker events file
+        let worker_events_file = self.ralph_dir
+            .join(format!("wave-{}-{}.jsonl", wave.wave_id, index));
+
         let permit = semaphore.clone().acquire_owned().await?;
         let handle = tokio::spawn(async move {
-            let result = execute_wave_instance(instance, hat_config, backend).await;
+            let result = execute_wave_instance(
+                event, &wave.hat_config, backend,
+                &worker_events_file, &wave.wave_id, index as u32,
+            ).await;
             drop(permit); // release concurrency slot
             result
         });
         handles.push(handle);
     }
 
-    // Collect all results (with per-wave timeout)
-    let timeout = Duration::from_secs(aggregate_timeout as u64);
+    // Collect all results (with aggregate timeout from downstream aggregator config)
+    let timeout = self.resolve_aggregate_timeout(&wave);
     let results = tokio::time::timeout(timeout,
         futures::future::join_all(handles)
     ).await;
 
-    // Handle timeout vs. completion
+    // On timeout: cancel running instances (SIGTERM, then SIGKILL after 250ms)
+    // Merge results from per-worker files into main events file
+    // Clean up per-worker files
+    // Return CompletedWave with results, failures, cost data
 }
 ```
 
 **Wave instance execution:**
 Each wave instance gets:
-- A fresh backend process (ACP or PTY, matching the hat's backend config)
+- A fresh backend process (ACP or PTY, matching the worker hat's backend config)
 - The worker hat's instructions as system context
 - The specific wave event payload as the prompt/task
 - Full tool access (same as normal hat execution)
 - No Ralph coordination context (no HATS table, no scratchpad, no objective)
+- Environment variables for wave context and isolation:
+
+```rust
+fn build_wave_instance_env(
+    wave_id: &str,
+    index: u32,
+    worker_events_file: &Path,
+) -> Vec<(String, String)> {
+    vec![
+        ("RALPH_WAVE_WORKER".into(), "1".into()),
+        ("RALPH_WAVE_ID".into(), wave_id.into()),
+        ("RALPH_WAVE_INDEX".into(), index.to_string()),
+        ("RALPH_EVENTS_FILE".into(), worker_events_file.display().to_string()),
+    ]
+}
+```
+
+These env vars are set on the spawned backend process and serve three purposes:
+1. `RALPH_WAVE_WORKER` — hard-blocks nested `ralph wave emit` calls
+2. `RALPH_WAVE_ID` + `RALPH_WAVE_INDEX` — auto-tags events emitted by `ralph emit` with wave correlation metadata
+3. `RALPH_EVENTS_FILE` — directs `ralph emit` output to the per-worker events file, avoiding concurrent writes to the main events file
+
+**Cost tracking:**
+Each `WaveInstanceResult` includes cost and token data extracted from the backend output:
+
+```rust
+pub struct WaveInstanceResult {
+    pub index: u32,
+    pub status: InstanceStatus,
+    pub events: Vec<Event>,          // parsed from per-worker events file
+    pub cost: f64,                   // API cost for this instance
+    pub tokens: u64,                 // token usage for this instance
+    pub duration: Duration,
+}
+```
+
+The loop runner accumulates costs across all instances and feeds them into the global `max_cost` check. Each instance counts as one activation against the worker hat's `max_activations`.
 
 ### 6. Wave Worker Prompt Builder
 
@@ -548,9 +606,10 @@ pub struct WaveWorkerContext {
     pub wave_index: u32,
     pub wave_total: u32,
     pub result_topics: Vec<String>,   // from hat's `publishes`
-    pub events_file: PathBuf,
 }
 ```
+
+The worker's events file path and wave metadata are communicated via env vars (see Section 5), not embedded in the prompt. The prompt only includes what the agent needs to understand its task — the env vars handle the plumbing transparently.
 
 ### 7. Context Injection for NL Dispatch
 
@@ -577,10 +636,7 @@ tools to fan out work in parallel.
 | review.maintain | Maintainability Reviewer | Reviews clarity, naming, duplication, coverage | up to 3 |
 
 Emit multiple events as a wave to process them in parallel:
-  ralph wave start --expect <N>
-  ralph emit <topic> "<payload>"
-  ... (repeat for each work item)
-  ralph wave end
+  ralph wave emit <topic> --payloads "<payload1>" "<payload2>" ...
 ```
 
 This context is injected only when:
@@ -589,32 +645,17 @@ This context is injected only when:
 
 ### 8. Aggregator Gate
 
-**Integrated into:** `crates/ralph-core/src/event_loop/mod.rs`
+**Owned by:** the loop runner (`crates/ralph-cli/src/loop_runner.rs`)
 
-The aggregator gate is a check in the event processing pipeline:
+The aggregator gate is implicit in the loop runner's wave lifecycle. The loop runner collects **all** wave results (or times out), then writes them to the main events file in a single batch. The event loop never sees partial wave results — by the time it processes events on the next iteration, all results are present.
 
-```rust
-fn should_activate_hat(&self, hat_id: &HatId, pending_events: &[Event]) -> bool {
-    let hat_config = self.registry.get_config(hat_id);
+This means:
+- No changes to `event_loop/mod.rs` for gating
+- No `should_activate_hat()` needed — the event loop's existing `determine_active_hats()` naturally picks up the aggregator hat because all its pending events appear at once
+- The `aggregate` config on the hat is used only by the **loop runner** to determine timeout duration
+- The `aggregate.mode: wait_for_all` is the loop runner's collection strategy, not an event loop filter
 
-    match &hat_config.aggregate {
-        Some(aggregate) => {
-            match aggregate.mode {
-                AggregateMode::WaitForAll => {
-                    // Check if all correlated results have arrived
-                    self.wave_tracker.is_wave_complete_for_hat(hat_id, pending_events)
-                }
-            }
-        }
-        None => {
-            // No aggregation — activate normally (existing behavior)
-            !pending_events.is_empty()
-        }
-    }
-}
-```
-
-When the gate opens, all wave results are delivered to Ralph as pending events in a single prompt:
+When all results are merged, Ralph activates as the aggregator persona and sees them as pending events in a single prompt:
 
 ```
 ## PENDING EVENTS
@@ -647,7 +688,7 @@ IMPORTANT: Do NOT use `ralph wave start`, `ralph wave end`, or
 nested waves are not supported.
 ```
 
-**Hard enforcement (CLI):** `ralph wave start` checks for an environment variable set by the loop runner for wave workers:
+**Hard enforcement (CLI):** `ralph wave emit` checks for the `RALPH_WAVE_WORKER` environment variable set by the loop runner on all wave worker processes:
 ```rust
 if std::env::var("RALPH_WAVE_WORKER").is_ok() {
     eprintln!("Error: nested waves are not supported. This instance is already a wave worker.");
@@ -661,7 +702,7 @@ if std::env::var("RALPH_WAVE_WORKER").is_ok() {
 
 ### Wave Event (JSONL format)
 
-Emitted by dispatcher:
+Emitted by dispatcher (written to main events file):
 ```json
 {
   "topic": "review.file",
@@ -673,7 +714,7 @@ Emitted by dispatcher:
 }
 ```
 
-Emitted by worker:
+Emitted by worker (written to per-worker events file, e.g., `.ralph/wave-w-a3f7b2c1-0.jsonl`):
 ```json
 {
   "topic": "review.result",
@@ -684,17 +725,7 @@ Emitted by worker:
 }
 ```
 
-### Wave State File (`.ralph/wave-state.json`)
-
-Transient file during wave emission:
-```json
-{
-  "wave_id": "w-a3f7b2c1",
-  "expected": 5,
-  "emitted": 3,
-  "started_at": "2026-02-28T10:00:00Z"
-}
-```
+The `wave_id` and `wave_index` are auto-tagged by `ralph emit` from the `RALPH_WAVE_ID` and `RALPH_WAVE_INDEX` env vars. `wave_total` is omitted on worker events — the loop runner already knows the expected total from the dispatch events.
 
 ### Hat Config (YAML)
 
@@ -736,6 +767,8 @@ hats:
 
 ### Completed Wave (internal)
 
+Returned by `execute_wave()` in the loop runner. Cost and token fields are accumulated from individual `WaveInstanceResult` structs (see Section 5).
+
 ```rust
 pub struct CompletedWave {
     pub wave_id: String,
@@ -762,7 +795,7 @@ When a wave instance fails:
 
 Failure types:
 - **Backend error** — API returned an error (rate limit, server error)
-- **Timeout** — instance exceeded its execution timeout (per-backend timeout, not wave timeout)
+- **Timeout** — instance exceeded the aggregate timeout (the aggregate timeout from the downstream aggregator hat's config applies to the entire wave; there is no separate per-instance timeout in v1)
 - **Crash** — backend process exited unexpectedly
 - **Scope violation** — instance emitted an event outside its `publishes` whitelist
 
@@ -772,7 +805,7 @@ When `aggregate.timeout` fires:
 1. All running instances are cancelled (SIGTERM, then SIGKILL after 250ms)
 2. Aggregator activates with all results received so far
 3. Missing instances appear as `status: timeout` in the failure metadata
-4. A `wave.timeout` event is published for diagnostics
+4. A `diag.wave.timeout` event is logged to diagnostics (not published to the EventBus, to avoid accidental hat triggering)
 
 ### Nested Wave Attempt
 
@@ -806,7 +839,7 @@ If all instances fail or timeout:
 
 ```
 Given a hat collection with a dispatcher, worker (concurrency: 3), and aggregator
-When the dispatcher emits 5 wave events using `ralph wave start --expect 5` / `ralph emit` / `ralph wave end`
+When the dispatcher emits 5 wave events using `ralph wave emit <topic> --payloads ...`
 Then the loop runner spawns worker backends with max 3 concurrent
 And each worker receives the hat's full instructions plus its specific event payload
 And each worker has full tool access
@@ -864,10 +897,21 @@ And wave emission instructions are included
 ### Nested Wave Prevention
 
 ```
-Given a wave worker instance
-When the worker attempts `ralph wave start`
+Given a wave worker instance (RALPH_WAVE_WORKER=1)
+When the worker attempts `ralph wave emit`
 Then the command fails with an error message
 And the worker's iteration counts as a failure
+```
+
+### Per-Worker Event Isolation
+
+```
+Given a wave with 3 worker instances
+When workers emit result events via `ralph emit`
+Then each worker writes to its own events file (.ralph/wave-{wave_id}-{index}.jsonl)
+And the main events file is not written to during wave execution
+And after wave completion the loop runner merges all per-worker results into the main events file
+And per-worker files are cleaned up
 ```
 
 ### Backwards Compatibility
@@ -879,14 +923,14 @@ Then behavior is identical to pre-wave Ralph (sequential, one hat per iteration)
 And events without wave metadata are processed normally
 ```
 
-### Batch Emission
+### Wave Emission
 
 ```
 Given an agent running `ralph wave emit research.topic --payloads "AI safety" "quantum computing" "climate modeling"`
 When the command executes
 Then 3 events are written to the events file
 And each has the same wave_id with wave_index 0, 1, 2 and wave_total 3
-And no wave state file is left behind
+And the wave_id is printed to stdout
 ```
 
 ---
@@ -898,7 +942,7 @@ And no wave state file is left behind
 - **Event model**: wave metadata serialization/deserialization, backwards compatibility with events missing wave fields
 - **WaveTracker**: state machine transitions, timeout detection, result collection, failure recording
 - **Config validation**: concurrency bounds, aggregate validation, invalid combinations
-- **Aggregator gate**: `should_activate_hat()` with various wave completion states
+- **Wave result merging**: per-worker file reading, main file merging, cleanup
 - **Context injection**: downstream hat description generation, wave instruction formatting
 - **EventReader**: parsing wave-annotated JSONL, mixed wave/non-wave events
 
@@ -909,7 +953,7 @@ And no wave state file is left behind
 - **Timeout handling**: wave with slow instances, verify aggregator fires after timeout with partial results
 - **Failure propagation**: instance failures recorded, aggregator receives failure metadata
 - **Activation accounting**: verify per-instance counting against max_activations
-- **Nested wave prevention**: worker attempts wave start, verify hard block
+- **Nested wave prevention**: worker attempts `ralph wave emit`, verify hard block
 
 ### Smoke Tests (replay-based)
 
@@ -924,11 +968,11 @@ And no wave state file is left behind
 
 ### CLI Tests
 
-- **`ralph wave start`**: generates wave ID, creates state file
-- **`ralph emit` with active wave**: tags events correctly
-- **`ralph wave end`**: validates count, cleans up state file
-- **`ralph wave emit`**: batch emission produces correct JSONL
-- **Nested prevention**: `RALPH_WAVE_WORKER=1 ralph wave start` fails
+- **`ralph wave emit`**: batch emission produces correct JSONL with wave metadata
+- **`ralph emit` with wave env vars**: auto-tags events with `wave_id` and `wave_index`
+- **`ralph emit` with `RALPH_EVENTS_FILE`**: writes to specified file instead of default
+- **`ralph emit` without wave env vars**: unchanged behavior (backwards compatible)
+- **Nested prevention**: `RALPH_WAVE_WORKER=1 ralph wave emit` fails
 
 ---
 
@@ -939,8 +983,9 @@ And no wave state file is left behind
 | Choice | Rationale |
 |--------|-----------|
 | `tokio::sync::Semaphore` for concurrency | Already using tokio throughout; semaphore is the standard pattern for limiting concurrent async tasks |
-| Timestamp-based wave IDs | Matches existing `generate_prompt_id()` pattern; avoids uuid dependency |
-| File-based wave state (`.ralph/wave-state.json`) | Consistent with existing file-based coordination (events.jsonl, loop.lock) |
+| Timestamp-based wave IDs (`w-{:08x}`) | Simple, collision-resistant within a process; avoids uuid dependency |
+| Per-worker events files | Avoids concurrent writes to the main events file; `EventReader` is position-tracking and not concurrent-safe |
+| Environment variables for worker context | Transparent plumbing — `ralph emit` reads env vars, workers don't need to know the mechanics |
 | Serde optional fields for wave metadata | Backwards compatible; existing events without wave fields parse correctly |
 
 ### B. Research Findings
@@ -949,9 +994,9 @@ Key findings from codebase research (full details in `research/` directory):
 
 1. **Event system** is file-based (JSONL), not in-process. Events flow: agent CLI → file → EventReader → EventBus. Extension is clean — add optional fields with serde defaults.
 
-2. **Loop runner** is strictly sequential with one backend per iteration. The bottleneck is `tokio::select!` in `loop_runner.rs:1214`. Wave execution inserts a new async phase between event processing and the next normal iteration.
+2. **Loop runner** is strictly sequential with one backend per iteration. The main loop is a `loop {}` at ~line 788, processing one hat per cycle. Wave execution inserts a new async phase between event processing and the next normal iteration.
 
-3. **Hatless Ralph** is the constant coordinator — custom hats are personas, not independent executors. Wave workers are the **first case where hats execute directly** with their own backend process, outside Ralph's coordination. This is a deliberate, bounded exception to the model.
+3. **Hatless Ralph** is the constant coordinator — `next_hat()` always returns "ralph" in multi-hat mode. Custom hats are personas, not independent executors. Wave workers are the **first case where hats execute directly** with their own backend process, outside Ralph's coordination. See "Architectural Impact" section for why this is safe.
 
 4. **HATS table** already resolves `publishes` → downstream hats with descriptions and Mermaid flowcharts. Context injection for NL dispatch extends this existing mechanism.
 
@@ -971,6 +1016,7 @@ Key findings from codebase research (full details in `research/` directory):
 
 ### D. Future Extensions (v2+)
 
+- **Incremental wave emission**: `ralph wave start`/`ralph wave end` for dynamic wave sizing (when the dispatcher doesn't know the count upfront)
 - **Worktree isolation**: `isolation: worktree` for write-heavy waves, using existing `create_worktree()` infrastructure
 - **Nested waves**: wave workers emitting sub-waves for hierarchical decomposition
 - **Additional aggregation modes**: `first_n` (activate after N results), `quorum` (majority), `external_event` (wait for external signal)
