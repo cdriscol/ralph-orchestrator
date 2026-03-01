@@ -1311,6 +1311,13 @@ pub struct HatConfig {
     #[serde(default)]
     pub disallowed_tools: Vec<String>,
 
+    /// Execution timeout in seconds for this hat.
+    ///
+    /// For wave workers, this controls how long each parallel worker can run.
+    /// Defaults to the adapter-level timeout (typically 300s) if not set.
+    #[serde(default)]
+    pub timeout: Option<u32>,
+
     /// Maximum concurrent wave instances for this hat.
     ///
     /// When > 1, the loop runner spawns multiple backend instances in parallel

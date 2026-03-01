@@ -1436,6 +1436,7 @@ pub async fn run_loop_impl(
                         if let Err(e) = merge_wave_results_to_events_file(
                             &completed,
                             &main_events_file,
+                            &detected.hat_config.publishes,
                         ) {
                             warn!(error = %e, "Failed to merge wave results to events file");
                         }
@@ -2392,11 +2393,17 @@ async fn execute_wave(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
     // Determine timeout for wave workers
+    // Priority: hat.timeout > hat.aggregate.timeout > default 300s
     let timeout_secs = wave
         .hat_config
-        .aggregate
-        .as_ref()
-        .map(|a| a.timeout as u64)
+        .timeout
+        .map(|t| t as u64)
+        .or_else(|| {
+            wave.hat_config
+                .aggregate
+                .as_ref()
+                .map(|a| a.timeout as u64)
+        })
         .unwrap_or(300);
     let wave_timeout = Duration::from_secs(timeout_secs);
 
@@ -2480,7 +2487,12 @@ async fn execute_wave(
                     // Clean up worker file
                     let _ = fs::remove_file(&worker_events_path);
 
-                    (index, Ok((events, duration, exec_result.success)))
+                    if exec_result.timed_out && events.is_empty() {
+                        // Worker timed out without emitting events — record as failure
+                        (index, Err((format!("Worker timed out after {}s without emitting events", wave_timeout.as_secs()), duration)))
+                    } else {
+                        (index, Ok((events, duration, exec_result.success)))
+                    }
                 }
                 Err(e) => {
                     let _ = fs::remove_file(&worker_events_path);
@@ -2548,6 +2560,7 @@ fn read_worker_events(path: &Path) -> Vec<ralph_core::Event> {
 fn merge_wave_results_to_events_file(
     completed: &ralph_core::CompletedWave,
     events_file: &Path,
+    publish_topics: &[String],
 ) -> Result<()> {
     use std::io::Write;
 
@@ -2584,6 +2597,23 @@ fn merge_wave_results_to_events_file(
         });
         let json_line = serde_json::to_string(&record)?;
         writeln!(file, "{}", json_line)?;
+
+        // Emit synthetic events on the hat's publish topics so downstream
+        // aggregators can still trigger even when workers fail/timeout
+        for topic in publish_topics {
+            let record = serde_json::json!({
+                "topic": topic,
+                "payload": format!(
+                    "## Worker {} (TIMED OUT)\n\nWorker timed out after {}s. No review results available.\n\nError: {}",
+                    failure.index, completed.duration.as_secs(), failure.error
+                ),
+                "ts": ts,
+                "wave_id": completed.wave_id,
+                "wave_index": failure.index,
+            });
+            let json_line = serde_json::to_string(&record)?;
+            writeln!(file, "{}", json_line)?;
+        }
     }
 
     Ok(())

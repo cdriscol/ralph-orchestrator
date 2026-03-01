@@ -62,6 +62,7 @@ hats:
     triggers: ["review.perspective"]
     publishes: ["review.done"]
     concurrency: 3
+    timeout: 600
     instructions: |
       ## REVIEWER MODE — Specialized Review
 
