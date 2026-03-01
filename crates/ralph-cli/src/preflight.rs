@@ -1,5 +1,7 @@
 //! Preflight command for validating configuration and environment.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, ValueEnum};
 use ralph_core::{CheckResult, CheckStatus, PreflightReport, PreflightRunner, RalphConfig};
@@ -201,6 +203,11 @@ pub(crate) async fn load_config_for_preflight(
 
     validate_core_config_shape(&core_value, &core_label)?;
 
+    // Resolve hat imports in core config (if loaded from a file)
+    if let Some(base_dir) = core_file_base_dir(config_sources) {
+        resolve_hat_imports_in_value(&mut core_value, "hats", &base_dir, &core_label)?;
+    }
+
     if let Some(source) = hats_source {
         if let Some(mapping) = core_value.as_mapping()
             && (mapping_get(mapping, "hats").is_some() || mapping_get(mapping, "events").is_some())
@@ -212,8 +219,37 @@ pub(crate) async fn load_config_for_preflight(
             );
         }
 
-        let hats_value = load_hats_value(source).await?;
+        let mut hats_value = load_hats_value(source).await?;
         validate_hats_config_shape(&hats_value, &source.label())?;
+
+        // Resolve hat imports in hats source
+        match source {
+            HatsSource::File(path) => {
+                let base_dir = path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+                resolve_hat_imports_in_value(
+                    &mut hats_value,
+                    "hats",
+                    &base_dir,
+                    &source.label(),
+                )?;
+            }
+            HatsSource::Builtin(name) => {
+                // Reject any import: keys in embedded presets
+                if let Some(mapping) = hats_value.as_mapping()
+                    && let Some(hats_mapping) = mapping_get(mapping, "hats")
+                    && let Some(hats_m) = hats_mapping.as_mapping()
+                {
+                    reject_builtin_imports(hats_m, name)?;
+                }
+            }
+            HatsSource::Remote(_) => {
+                // Remote hats can't resolve local file imports — skip
+            }
+        }
+
         core_value = merge_hats_overlay(core_value, hats_value)?;
     }
 
@@ -495,6 +531,174 @@ fn extract_hat_overlay_from_preset(preset_value: Value) -> Result<Value> {
     Ok(Value::Mapping(overlay))
 }
 
+/// Merges an imported hat definition with local overrides.
+///
+/// The imported hat provides base values. Any field present in `local_overrides`
+/// replaces the corresponding field from `imported`. The `import:` key is
+/// removed from the result.
+fn merge_imported_hat(mut imported: Mapping, local_overrides: &Mapping) -> Mapping {
+    let import_key = Value::String("import".to_string());
+    for (key, value) in local_overrides {
+        if key == &import_key {
+            continue;
+        }
+        imported.insert(key.clone(), value.clone());
+    }
+    imported.remove(&import_key);
+    imported
+}
+
+/// Resolves `import:` keys in a hats mapping.
+///
+/// For each hat that contains an `import:` key:
+/// 1. Resolves the path (relative to `base_dir`, or absolute as-is)
+/// 2. Reads and parses the referenced file as YAML
+/// 3. Validates it contains no `import:` key (no transitive imports)
+/// 4. Validates it contains no `events:` key (not allowed in hat files)
+/// 5. Uses the imported fields as a base, overlays local fields on top
+/// 6. Removes the `import:` key from the result
+fn resolve_hat_imports(hats: &mut Mapping, base_dir: &Path, source_label: &str) -> Result<()> {
+    let import_key = Value::String("import".to_string());
+
+    // Collect hat IDs that have imports (can't mutate while iterating)
+    let hat_ids_with_imports: Vec<Value> = hats
+        .iter()
+        .filter_map(|(id, def)| {
+            def.as_mapping()
+                .and_then(|m| m.get(&import_key))
+                .map(|_| id.clone())
+        })
+        .collect();
+
+    for hat_id in hat_ids_with_imports {
+        let hat_id_str = hat_id.as_str().unwrap_or("<non-string>");
+        let hat_def = hats.get(&hat_id).unwrap().as_mapping().unwrap();
+        let import_value = hat_def.get(&import_key).unwrap();
+
+        let import_path_str = import_value.as_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n\n  \
+                 cause: 'import' must be a string file path"
+            )
+        })?;
+
+        let import_path = std::path::Path::new(import_path_str);
+        let resolved_path = if import_path.is_absolute() {
+            import_path.to_path_buf()
+        } else {
+            base_dir.join(import_path)
+        };
+
+        let content = std::fs::read_to_string(&resolved_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n  \
+                 --> imports {}\n\n  \
+                 cause: {e}",
+                resolved_path.display()
+            )
+        })?;
+
+        let imported_value: Value = serde_yaml::from_str(&content).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n  \
+                 --> imports {}\n\n  \
+                 cause: {e}",
+                resolved_path.display()
+            )
+        })?;
+
+        let imported_mapping = imported_value.as_mapping().ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n  \
+                 --> imports {}\n\n  \
+                 cause: imported hat file must be a YAML mapping",
+                resolved_path.display()
+            )
+        })?;
+
+        if imported_mapping.get(&import_key).is_some() {
+            anyhow::bail!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n  \
+                 --> imports {}\n\n  \
+                 cause: imported hat files cannot contain 'import:' directives \
+                 (transitive imports are not supported)",
+                resolved_path.display()
+            );
+        }
+
+        let events_key = Value::String("events".to_string());
+        if imported_mapping.get(&events_key).is_some() {
+            anyhow::bail!(
+                "failed to resolve hat import\n  \
+                 --> {source_label}, hat '{hat_id_str}'\n  \
+                 --> imports {}\n\n  \
+                 cause: imported hat files cannot contain 'events:' \
+                 — event metadata belongs in the consuming preset",
+                resolved_path.display()
+            );
+        }
+
+        let local_overrides = hat_def.clone();
+        let merged = merge_imported_hat(imported_mapping.clone(), &local_overrides);
+        hats.insert(hat_id, Value::Mapping(merged));
+    }
+
+    Ok(())
+}
+
+/// Checks if any hat in a hats mapping contains an `import:` key.
+/// Used to reject imports in embedded presets which have no filesystem context.
+fn reject_builtin_imports(hats: &Mapping, _preset_name: &str) -> Result<()> {
+    let import_key = Value::String("import".to_string());
+    for (id, def) in hats {
+        if let Some(mapping) = def.as_mapping()
+            && mapping.get(&import_key).is_some()
+        {
+            let hat_id = id.as_str().unwrap_or("<non-string>");
+            anyhow::bail!(
+                "hat imports are not supported in embedded presets \
+                 — '{hat_id}' contains an 'import:' directive.\n\n\
+                 hint: use a file-based preset to use hat imports"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Extracts the base directory from the primary file-based config source.
+fn core_file_base_dir(config_sources: &[ConfigSource]) -> Option<std::path::PathBuf> {
+    config_sources.iter().find_map(|s| match s {
+        ConfigSource::File(path) => Some(
+            path.parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf(),
+        ),
+        _ => None,
+    })
+}
+
+/// Resolves hat imports within a Value that contains a nested hats mapping
+/// at the given `hats_key` (e.g., "hats").
+fn resolve_hat_imports_in_value(
+    value: &mut Value,
+    hats_key: &str,
+    base_dir: &std::path::Path,
+    source_label: &str,
+) -> Result<()> {
+    let key = Value::String(hats_key.to_string());
+    if let Some(mapping) = value.as_mapping_mut()
+        && let Some(Value::Mapping(hats_mapping)) = mapping.get_mut(&key)
+    {
+        resolve_hat_imports(hats_mapping, base_dir, source_label)?;
+    }
+    Ok(())
+}
+
 fn merge_hats_overlay(mut core: Value, hats: Value) -> Result<Value> {
     let core_mapping = core
         .as_mapping_mut()
@@ -732,6 +936,640 @@ hats:
         assert_eq!(config.event_loop.completion_promise, "REVIEW_COMPLETE");
         assert!(config.hats.contains_key("reviewer"));
         assert!(!config.hats.contains_key("builder"));
+    }
+
+    // ---- Hat import tests ----
+
+    #[test]
+    fn merge_imported_hat_uses_imported_fields_as_base() {
+        let imported: Mapping = serde_yaml::from_str(
+            r#"
+name: "Builder"
+description: "TDD builder"
+max_activations: 5
+"#,
+        )
+        .unwrap();
+        let local: Mapping = Mapping::new();
+
+        let result = merge_imported_hat(imported, &local);
+        assert_eq!(
+            result.get(&Value::String("name".into())),
+            Some(&Value::String("Builder".into()))
+        );
+        assert_eq!(
+            result.get(&Value::String("max_activations".into())),
+            Some(&Value::Number(5.into()))
+        );
+    }
+
+    #[test]
+    fn merge_imported_hat_local_override_replaces_field() {
+        let imported: Mapping = serde_yaml::from_str(
+            r#"
+name: "Builder"
+max_activations: 5
+"#,
+        )
+        .unwrap();
+        let local: Mapping = serde_yaml::from_str(
+            r#"
+import: "./builder.yml"
+max_activations: 3
+"#,
+        )
+        .unwrap();
+
+        let result = merge_imported_hat(imported, &local);
+        assert_eq!(
+            result.get(&Value::String("max_activations".into())),
+            Some(&Value::Number(3.into()))
+        );
+        // import key should be removed
+        assert!(result.get(&Value::String("import".into())).is_none());
+    }
+
+    #[test]
+    fn merge_imported_hat_list_override_replaces_not_merges() {
+        let imported: Mapping = serde_yaml::from_str(
+            r#"
+publishes:
+  - build.done
+  - build.blocked
+"#,
+        )
+        .unwrap();
+        let local: Mapping = serde_yaml::from_str(
+            r#"
+import: "./builder.yml"
+publishes:
+  - build.done
+"#,
+        )
+        .unwrap();
+
+        let result = merge_imported_hat(imported, &local);
+        let publishes = result
+            .get(&Value::String("publishes".into()))
+            .unwrap()
+            .as_sequence()
+            .unwrap();
+        assert_eq!(publishes.len(), 1);
+        assert_eq!(publishes[0], Value::String("build.done".into()));
+    }
+
+    #[test]
+    fn resolve_hat_imports_basic_import() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let hat_file = temp_dir.path().join("builder.yml");
+        std::fs::write(
+            &hat_file,
+            r#"
+name: "Builder"
+description: "TDD builder"
+max_activations: 5
+"#,
+        )
+        .unwrap();
+
+        let mut hats: Mapping = serde_yaml::from_str(&format!(
+            r#"
+builder:
+  import: ./builder.yml
+"#
+        ))
+        .unwrap();
+
+        resolve_hat_imports(&mut hats, temp_dir.path(), "test.yml").unwrap();
+
+        let builder = hats
+            .get(&Value::String("builder".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            builder.get(&Value::String("name".into())),
+            Some(&Value::String("Builder".into()))
+        );
+        assert_eq!(
+            builder.get(&Value::String("max_activations".into())),
+            Some(&Value::Number(5.into()))
+        );
+        // import key removed
+        assert!(builder.get(&Value::String("import".into())).is_none());
+    }
+
+    #[test]
+    fn resolve_hat_imports_with_local_override() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let hat_file = temp_dir.path().join("builder.yml");
+        std::fs::write(
+            &hat_file,
+            r#"
+name: "Builder"
+max_activations: 5
+"#,
+        )
+        .unwrap();
+
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./builder.yml
+  max_activations: 3
+"#,
+        )
+        .unwrap();
+
+        resolve_hat_imports(&mut hats, temp_dir.path(), "test.yml").unwrap();
+
+        let builder = hats
+            .get(&Value::String("builder".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            builder.get(&Value::String("max_activations".into())),
+            Some(&Value::Number(3.into()))
+        );
+    }
+
+    #[test]
+    fn resolve_hat_imports_no_op_for_hats_without_import() {
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  name: "Builder"
+  max_activations: 5
+"#,
+        )
+        .unwrap();
+
+        let original = hats.clone();
+        resolve_hat_imports(&mut hats, Path::new("/tmp"), "test.yml").unwrap();
+        assert_eq!(hats, original);
+    }
+
+    #[test]
+    fn resolve_hat_imports_rejects_transitive_import() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let hat_file = temp_dir.path().join("builder.yml");
+        std::fs::write(
+            &hat_file,
+            r#"
+name: "Builder"
+import: ./other.yml
+"#,
+        )
+        .unwrap();
+
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./builder.yml
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_hat_imports(&mut hats, temp_dir.path(), "test.yml").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("imported hat files cannot contain 'import:' directives"));
+    }
+
+    #[test]
+    fn resolve_hat_imports_rejects_events_in_imported() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let hat_file = temp_dir.path().join("builder.yml");
+        std::fs::write(
+            &hat_file,
+            r#"
+name: "Builder"
+events:
+  build.start:
+    triggers: ["builder"]
+"#,
+        )
+        .unwrap();
+
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./builder.yml
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_hat_imports(&mut hats, temp_dir.path(), "test.yml").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("imported hat files cannot contain 'events:'"));
+    }
+
+    #[test]
+    fn resolve_hat_imports_file_not_found() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./nonexistent.yml
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_hat_imports(&mut hats, temp_dir.path(), "test.yml").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("failed to resolve hat import"));
+        assert!(msg.contains("hat 'builder'"));
+        assert!(msg.contains("nonexistent.yml"));
+    }
+
+    #[test]
+    fn resolve_hat_imports_non_string_import_path() {
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: 42
+"#,
+        )
+        .unwrap();
+
+        let err = resolve_hat_imports(&mut hats, Path::new("/tmp"), "test.yml").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("'import' must be a string file path"));
+    }
+
+    #[test]
+    fn resolve_hat_imports_multiple_hats() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            temp_dir.path().join("builder.yml"),
+            r#"
+name: "Builder"
+max_activations: 5
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            temp_dir.path().join("reviewer.yml"),
+            r#"
+name: "Reviewer"
+max_activations: 3
+"#,
+        )
+        .unwrap();
+
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./builder.yml
+reviewer:
+  import: ./reviewer.yml
+"#,
+        )
+        .unwrap();
+
+        resolve_hat_imports(&mut hats, temp_dir.path(), "test.yml").unwrap();
+
+        let builder = hats
+            .get(&Value::String("builder".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            builder.get(&Value::String("name".into())),
+            Some(&Value::String("Builder".into()))
+        );
+
+        let reviewer = hats
+            .get(&Value::String("reviewer".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            reviewer.get(&Value::String("name".into())),
+            Some(&Value::String("Reviewer".into()))
+        );
+    }
+
+    #[test]
+    fn resolve_hat_imports_absolute_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let hat_file = temp_dir.path().join("builder.yml");
+        std::fs::write(
+            &hat_file,
+            r#"
+name: "Builder"
+"#,
+        )
+        .unwrap();
+
+        let yaml = format!(
+            "builder:\n  import: {}",
+            hat_file.display()
+        );
+        let mut hats: Mapping = serde_yaml::from_str(&yaml).unwrap();
+
+        // Use a different base_dir to prove absolute path is used, not joined
+        resolve_hat_imports(&mut hats, Path::new("/nonexistent"), "test.yml").unwrap();
+
+        let builder = hats
+            .get(&Value::String("builder".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            builder.get(&Value::String("name".into())),
+            Some(&Value::String("Builder".into()))
+        );
+    }
+
+    #[test]
+    fn resolve_hat_imports_name_from_override() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("template.yml"),
+            r#"
+description: "A template hat"
+max_activations: 5
+"#,
+        )
+        .unwrap();
+
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./template.yml
+  name: "My Builder"
+"#,
+        )
+        .unwrap();
+
+        resolve_hat_imports(&mut hats, temp_dir.path(), "test.yml").unwrap();
+
+        let builder = hats
+            .get(&Value::String("builder".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            builder.get(&Value::String("name".into())),
+            Some(&Value::String("My Builder".into()))
+        );
+        assert_eq!(
+            builder.get(&Value::String("description".into())),
+            Some(&Value::String("A template hat".into()))
+        );
+    }
+
+    #[test]
+    fn resolve_hat_imports_mixed_inline_and_imported() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("builder.yml"),
+            r#"
+name: "Imported Builder"
+max_activations: 5
+"#,
+        )
+        .unwrap();
+
+        let mut hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./builder.yml
+reviewer:
+  name: "Inline Reviewer"
+  max_activations: 3
+"#,
+        )
+        .unwrap();
+
+        resolve_hat_imports(&mut hats, temp_dir.path(), "test.yml").unwrap();
+
+        let builder = hats
+            .get(&Value::String("builder".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            builder.get(&Value::String("name".into())),
+            Some(&Value::String("Imported Builder".into()))
+        );
+
+        let reviewer = hats
+            .get(&Value::String("reviewer".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            reviewer.get(&Value::String("name".into())),
+            Some(&Value::String("Inline Reviewer".into()))
+        );
+    }
+
+    #[test]
+    fn reject_builtin_imports_catches_import_key() {
+        let hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  import: ./builder.yml
+  name: "Builder"
+"#,
+        )
+        .unwrap();
+
+        let err = reject_builtin_imports(&hats, "feature").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("hat imports are not supported in embedded presets"));
+        assert!(msg.contains("'builder'"));
+    }
+
+    #[test]
+    fn reject_builtin_imports_allows_no_imports() {
+        let hats: Mapping = serde_yaml::from_str(
+            r#"
+builder:
+  name: "Builder"
+  max_activations: 5
+"#,
+        )
+        .unwrap();
+
+        assert!(reject_builtin_imports(&hats, "feature").is_ok());
+    }
+
+    #[tokio::test]
+    async fn load_config_for_preflight_resolves_core_hat_imports() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create shared hat file
+        let shared_dir = temp_dir.path().join("shared");
+        std::fs::create_dir(&shared_dir).unwrap();
+        std::fs::write(
+            shared_dir.join("builder.yml"),
+            r#"
+name: "Imported Builder"
+description: "A shared builder hat"
+"#,
+        )
+        .unwrap();
+
+        // Create core config with hat import
+        let core_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(
+            &core_path,
+            r#"
+cli:
+  backend: claude
+event_loop:
+  max_iterations: 50
+  completion_promise: LOOP_COMPLETE
+hats:
+  builder:
+    import: ./shared/builder.yml
+    max_activations: 3
+"#,
+        )
+        .unwrap();
+
+        let config = load_config_for_preflight(&[ConfigSource::File(core_path)], None)
+            .await
+            .unwrap();
+
+        let builder = config.hats.get("builder").unwrap();
+        assert_eq!(builder.name, "Imported Builder");
+        assert_eq!(builder.description, Some("A shared builder hat".to_string()));
+        assert_eq!(builder.max_activations, Some(3));
+    }
+
+    #[tokio::test]
+    async fn load_config_for_preflight_resolves_hats_source_imports() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create shared hat file
+        let shared_dir = temp_dir.path().join("shared");
+        std::fs::create_dir(&shared_dir).unwrap();
+        std::fs::write(
+            shared_dir.join("reviewer.yml"),
+            r#"
+name: "Imported Reviewer"
+description: "A shared reviewer hat"
+"#,
+        )
+        .unwrap();
+
+        // Create core config
+        let core_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(
+            &core_path,
+            r#"
+cli:
+  backend: claude
+event_loop:
+  max_iterations: 50
+  completion_promise: LOOP_COMPLETE
+"#,
+        )
+        .unwrap();
+
+        // Create hats file with import
+        let hats_path = temp_dir.path().join("hats.yml");
+        std::fs::write(
+            &hats_path,
+            r#"
+hats:
+  reviewer:
+    import: ./shared/reviewer.yml
+    max_activations: 2
+"#,
+        )
+        .unwrap();
+
+        let config = load_config_for_preflight(
+            &[ConfigSource::File(core_path)],
+            Some(&HatsSource::File(hats_path)),
+        )
+        .await
+        .unwrap();
+
+        let reviewer = config.hats.get("reviewer").unwrap();
+        assert_eq!(reviewer.name, "Imported Reviewer");
+        assert_eq!(reviewer.description, Some("A shared reviewer hat".to_string()));
+        assert_eq!(reviewer.max_activations, Some(2));
+    }
+
+    #[tokio::test]
+    async fn load_config_for_preflight_split_config_resolves_independently() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create two separate shared hat directories
+        let core_shared = temp_dir.path().join("core-shared");
+        std::fs::create_dir(&core_shared).unwrap();
+        std::fs::write(
+            core_shared.join("builder.yml"),
+            r#"
+name: "Core Builder"
+description: "From core shared"
+"#,
+        )
+        .unwrap();
+
+        let hats_shared = temp_dir.path().join("hats-shared");
+        std::fs::create_dir(&hats_shared).unwrap();
+        std::fs::write(
+            hats_shared.join("reviewer.yml"),
+            r#"
+name: "Hats Reviewer"
+description: "From hats shared"
+"#,
+        )
+        .unwrap();
+
+        // Core config with import (its builder will be overridden by hats source)
+        let core_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(
+            &core_path,
+            r#"
+cli:
+  backend: claude
+event_loop:
+  max_iterations: 50
+  completion_promise: LOOP_COMPLETE
+hats:
+  builder:
+    import: ./core-shared/builder.yml
+"#,
+        )
+        .unwrap();
+
+        // Hats file with its own import
+        let hats_path = temp_dir.path().join("hats.yml");
+        std::fs::write(
+            &hats_path,
+            r#"
+hats:
+  reviewer:
+    import: ./hats-shared/reviewer.yml
+"#,
+        )
+        .unwrap();
+
+        let config = load_config_for_preflight(
+            &[ConfigSource::File(core_path)],
+            Some(&HatsSource::File(hats_path)),
+        )
+        .await
+        .unwrap();
+
+        // Hats source overrides core hats
+        assert!(!config.hats.contains_key("builder"));
+        let reviewer = config.hats.get("reviewer").unwrap();
+        assert_eq!(reviewer.name, "Hats Reviewer");
     }
 
     #[test]
