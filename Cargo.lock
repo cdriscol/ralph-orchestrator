@@ -2594,6 +2594,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "crossterm 0.28.1",
+ "futures",
  "indicatif",
  "keyring",
  "nix 0.29.0",

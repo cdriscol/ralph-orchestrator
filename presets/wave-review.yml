@@ -1,0 +1,121 @@
+# Wave Review: Scatter-Gather Parallel Code Review
+# Pattern: Dispatch files to parallel reviewers, aggregate findings
+#
+# 3 Hats:
+# - Dispatcher: Identifies files to review and dispatches wave
+# - Reviewer: Reviews individual files in parallel (concurrency: 4)
+# - Synthesizer: Aggregates review findings into final report
+#
+# Usage:
+#   ralph run --hats presets/wave-review.yml --prompt "Review the authentication module"
+
+event_loop:
+  prompt_file: "PROMPT.md"
+  completion_promise: "LOOP_COMPLETE"
+  starting_event: "review.start"
+  max_iterations: 20
+  max_runtime_seconds: 3600
+
+cli:
+  backend: "claude"
+
+core:
+  guardrails:
+    - "Each reviewer focuses on one file — do not review other files"
+    - "Be specific: cite line numbers and concrete improvements"
+    - "Distinguish critical issues from suggestions"
+
+hats:
+  dispatcher:
+    name: "📋 Dispatcher"
+    description: "Identifies review targets and dispatches a wave of file reviews."
+    triggers: ["review.start"]
+    publishes: ["review.file"]
+    instructions: |
+      ## DISPATCHER MODE — Identify and Dispatch Review Targets
+
+      Analyze the prompt to determine what to review, then dispatch files as a wave.
+
+      ### Process
+      1. Read the prompt to understand review scope
+      2. Identify relevant files (use git diff, file listing, etc.)
+      3. Filter to meaningful files (skip generated, vendored, lock files)
+      4. Dispatch via wave:
+
+      ```bash
+      ralph wave emit review.file --payloads "path/to/file1.rs" "path/to/file2.rs" "path/to/file3.rs"
+      ```
+
+      ### Constraints
+      - Dispatch ALL relevant files in a single wave
+      - Include file paths as payloads (reviewers will read them)
+      - Skip test fixtures, generated code, and lock files
+
+  reviewer:
+    name: "🔍 Reviewer"
+    description: "Reviews a single file for bugs, style, and improvements."
+    triggers: ["review.file"]
+    publishes: ["review.done"]
+    concurrency: 4
+    instructions: |
+      ## REVIEWER MODE — Single File Review
+
+      You review exactly one file. Focus and thoroughness are your strengths.
+
+      ### Review Checklist
+      1. **Read the file** — understand its purpose and context
+      2. **Check for bugs** — logic errors, edge cases, null handling
+      3. **Check for style** — naming, formatting, idiomatic patterns
+      4. **Check for security** — injection, validation, auth issues
+      5. **Check for performance** — unnecessary allocations, N+1 queries
+
+      ### Output Format
+      Publish your findings:
+      ```bash
+      ralph emit review.done "## file.rs\n\n### Critical\n- ...\n\n### Suggestions\n- ..."
+      ```
+
+      ### Constraints
+      - Review ONLY your assigned file
+      - Be specific: cite line numbers
+      - Distinguish critical issues from nice-to-haves
+
+  synthesizer:
+    name: "📊 Synthesizer"
+    description: "Aggregates parallel review findings into a unified report."
+    triggers: ["review.done"]
+    publishes: ["review.complete"]
+    aggregate:
+      mode: wait_for_all
+      timeout: 300
+    instructions: |
+      ## SYNTHESIZER MODE — Aggregate Review Findings
+
+      Collect all review results and produce a unified report.
+
+      ### Process
+      1. Read all review.done events from the pending events
+      2. Categorize findings by severity (Critical / Warning / Suggestion)
+      3. Identify cross-cutting themes
+      4. Write the report to `.ralph/agent/review-report.md`
+      5. Publish review.complete
+
+      ### Report Format
+      ```markdown
+      # Code Review Report
+
+      ## Summary
+      - Files reviewed: N
+      - Critical issues: N
+      - Warnings: N
+      - Suggestions: N
+
+      ## Critical Issues
+      ...
+
+      ## Cross-Cutting Themes
+      ...
+
+      ## Per-File Details
+      ...
+      ```

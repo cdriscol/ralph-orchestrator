@@ -1388,15 +1388,67 @@ pub async fn run_loop_impl(
             warn!(error = %e, "Failed to check planning session responses");
         }
 
-        // Read events from JSONL that agent may have written
-        let agent_wrote_events = event_loop
-            .process_events_from_jsonl()
-            .inspect_err(|e| warn!(error = %e, "Failed to read events from JSONL"))
-            .map(|r| r.had_events)
-            .unwrap_or(false);
+        // Read events from JSONL, partitioning wave events from regular events
+        let (agent_wrote_events, wave_events) = match event_loop
+            .process_events_from_jsonl_with_waves()
+        {
+            Ok(result) => (result.processed.had_events, result.wave_events),
+            Err(e) => {
+                warn!(error = %e, "Failed to read events from JSONL");
+                (false, Vec::new())
+            }
+        };
+
+        // Execute wave if wave events detected
+        if !wave_events.is_empty() {
+            if let Some(detected) =
+                ralph_core::detect_wave_events(&wave_events, event_loop.registry())
+            {
+                info!(
+                    wave_id = %detected.wave_id,
+                    total = detected.total,
+                    hat = %detected.target_hat,
+                    concurrency = detected.hat_config.concurrency,
+                    "Wave detected, executing parallel workers"
+                );
+
+                let main_events_file = resolve_current_events_path(&ctx);
+                let wave_result = execute_wave(
+                    &detected,
+                    &backend,
+                    &config,
+                    &main_events_file,
+                )
+                .await;
+
+                match wave_result {
+                    Ok(completed) => {
+                        info!(
+                            wave_id = %completed.wave_id,
+                            results = completed.results.len(),
+                            failures = completed.failures.len(),
+                            timed_out = completed.timed_out,
+                            duration_ms = completed.duration.as_millis() as u64,
+                            "Wave completed"
+                        );
+
+                        // Merge result events into main events file so aggregator hat picks them up
+                        if let Err(e) = merge_wave_results_to_events_file(
+                            &completed,
+                            &main_events_file,
+                        ) {
+                            warn!(error = %e, "Failed to merge wave results to events file");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Wave execution failed");
+                    }
+                }
+            }
+        }
 
         // Inject default_publishes for active hats only when agent wrote no events
-        if !agent_wrote_events {
+        if !agent_wrote_events && wave_events.is_empty() {
             let active_hats = event_loop.state().last_active_hat_ids.clone();
             for active_hat_id in &active_hats {
                 event_loop.check_default_publishes(active_hat_id);
@@ -2320,6 +2372,221 @@ fn create_robot_service(
             None
         }
     }
+}
+
+// ── Wave Execution ──────────────────────────────────────────────────────────
+
+/// Execute a detected wave by spawning parallel backend instances.
+///
+/// Creates per-worker event files, spawns workers with concurrency-limited
+/// semaphore, collects results, and returns a `CompletedWave`.
+async fn execute_wave(
+    wave: &ralph_core::DetectedWave,
+    global_backend: &CliBackend,
+    _config: &RalphConfig,
+    main_events_file: &Path,
+) -> Result<ralph_core::CompletedWave> {
+    use ralph_core::{WaveTracker, WaveWorkerContext, build_wave_worker_prompt};
+
+    let concurrency = wave.hat_config.concurrency as usize;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+
+    // Determine timeout for wave workers
+    let timeout_secs = wave
+        .hat_config
+        .aggregate
+        .as_ref()
+        .map(|a| a.timeout as u64)
+        .unwrap_or(300);
+    let wave_timeout = Duration::from_secs(timeout_secs);
+
+    // Register wave in tracker
+    let mut tracker = WaveTracker::new();
+    tracker.register_wave(
+        wave.wave_id.clone(),
+        wave.total,
+        wave.target_hat.clone(),
+        wave_timeout,
+    );
+
+    // Resolve per-worker events directory
+    let wave_dir = main_events_file
+        .parent()
+        .unwrap_or(Path::new(".ralph"))
+        .to_path_buf();
+
+    // Spawn workers
+    let mut handles = Vec::new();
+    for (index, event) in wave.events.iter().enumerate() {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let wave_id = wave.wave_id.clone();
+        let index = index as u32;
+        let event = event.clone();
+        let hat_config = wave.hat_config.clone();
+
+        // Create per-worker events file
+        let worker_events_file = wave_dir.join(format!("wave-{}-{}.jsonl", wave_id, index));
+
+        // Build worker prompt
+        let ctx = WaveWorkerContext {
+            wave_id: wave_id.clone(),
+            wave_index: index,
+            wave_total: wave.total,
+            result_topics: hat_config.publishes.clone(),
+        };
+        let prompt = build_wave_worker_prompt(&hat_config, &event, &ctx);
+
+        // Resolve backend for this worker
+        let mut worker_backend = if let Some(ref hat_backend) = hat_config.backend {
+            CliBackend::from_hat_backend(hat_backend).unwrap_or_else(|_| global_backend.clone())
+        } else {
+            global_backend.clone()
+        };
+
+        // Inject wave env vars
+        worker_backend.env_vars.extend([
+            ("RALPH_WAVE_WORKER".into(), "1".into()),
+            ("RALPH_WAVE_ID".into(), wave_id.clone()),
+            ("RALPH_WAVE_INDEX".into(), index.to_string()),
+            (
+                "RALPH_EVENTS_FILE".into(),
+                worker_events_file.display().to_string(),
+            ),
+        ]);
+
+        // Apply hat backend args
+        if let Some(ref args) = hat_config.backend_args {
+            worker_backend.args.extend(args.iter().cloned());
+        }
+
+        let worker_timeout = Some(wave_timeout);
+        let worker_events_path = worker_events_file.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = permit; // Hold permit for concurrency limiting
+            let start = std::time::Instant::now();
+
+            let executor = CliExecutor::new(worker_backend);
+            let result = executor
+                .execute(&prompt, std::io::sink(), worker_timeout, false)
+                .await;
+
+            let duration = start.elapsed();
+
+            match result {
+                Ok(exec_result) => {
+                    // Read result events from per-worker file
+                    let events = read_worker_events(&worker_events_path);
+                    // Clean up worker file
+                    let _ = fs::remove_file(&worker_events_path);
+
+                    (index, Ok((events, duration, exec_result.success)))
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&worker_events_path);
+                    (index, Err((e.to_string(), duration)))
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Collect results
+    let results = futures::future::join_all(handles).await;
+
+    for result in results {
+        match result {
+            Ok((index, Ok((events, _duration, _success)))) => {
+                let proto_events: Vec<ralph_proto::Event> = events
+                    .into_iter()
+                    .map(|e| {
+                        let mut pe = ralph_proto::Event::new(
+                            e.topic.as_str(),
+                            e.payload.unwrap_or_default(),
+                        );
+                        if let Some(ref wid) = e.wave_id {
+                            pe = pe.with_wave(wid, e.wave_index.unwrap_or(index), wave.total);
+                        }
+                        pe
+                    })
+                    .collect();
+                tracker.record_result(&wave.wave_id, index, proto_events);
+            }
+            Ok((index, Err((error, duration)))) => {
+                tracker.record_failure(&wave.wave_id, index, error, duration);
+            }
+            Err(join_err) => {
+                // Task panicked or was cancelled
+                warn!(error = %join_err, "Wave worker task failed");
+            }
+        }
+    }
+
+    // Take completed wave results
+    tracker
+        .take_wave_results(&wave.wave_id)
+        .ok_or_else(|| anyhow::anyhow!("Wave {} not found in tracker", wave.wave_id))
+}
+
+/// Read events from a per-worker events file.
+fn read_worker_events(path: &Path) -> Vec<ralph_core::Event> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ralph_core::Event>(line).ok())
+        .collect()
+}
+
+/// Merge wave result events into the main events file.
+///
+/// Appends all result events to the main JSONL file so the aggregator hat
+/// picks them up on the next iteration.
+fn merge_wave_results_to_events_file(
+    completed: &ralph_core::CompletedWave,
+    events_file: &Path,
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_file)
+        .with_context(|| format!("Failed to open events file: {}", events_file.display()))?;
+
+    let ts = chrono::Utc::now().to_rfc3339();
+
+    for result in &completed.results {
+        for event in &result.events {
+            let record = serde_json::json!({
+                "topic": event.topic.as_str(),
+                "payload": event.payload,
+                "ts": ts,
+                "wave_id": completed.wave_id,
+                "wave_index": result.index,
+            });
+            let json_line = serde_json::to_string(&record)?;
+            writeln!(file, "{}", json_line)?;
+        }
+    }
+
+    // Also write failure events so the aggregator knows about partial results
+    for failure in &completed.failures {
+        let record = serde_json::json!({
+            "topic": "wave.worker.failed",
+            "payload": format!("Worker {} failed: {}", failure.index, failure.error),
+            "ts": ts,
+            "wave_id": completed.wave_id,
+            "wave_index": failure.index,
+        });
+        let json_line = serde_json::to_string(&record)?;
+        writeln!(file, "{}", json_line)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

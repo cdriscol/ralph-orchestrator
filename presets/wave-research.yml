@@ -1,0 +1,119 @@
+# Wave Research: Parallel Research with Synthesis
+# Pattern: Dispatch research questions to parallel workers, synthesize findings
+#
+# 3 Hats:
+# - Planner: Breaks research topic into parallel questions
+# - Researcher: Investigates individual questions in parallel (concurrency: 3)
+# - Synthesizer: Combines research into coherent report
+#
+# Usage:
+#   ralph run --hats presets/wave-research.yml --prompt "Research error handling patterns in Rust async"
+
+event_loop:
+  prompt_file: "PROMPT.md"
+  completion_promise: "LOOP_COMPLETE"
+  starting_event: "research.start"
+  max_iterations: 20
+  max_runtime_seconds: 3600
+
+cli:
+  backend: "claude"
+
+core:
+  guardrails:
+    - "Each researcher focuses on their assigned question only"
+    - "Cite specific code, files, or documentation references"
+    - "Distinguish facts from opinions"
+
+hats:
+  planner:
+    name: "🎯 Planner"
+    description: "Breaks research topic into parallel investigation questions."
+    triggers: ["research.start"]
+    publishes: ["research.question"]
+    instructions: |
+      ## PLANNER MODE — Decompose Research Topic
+
+      Break the research topic into 2-5 independent questions that can be investigated in parallel.
+
+      ### Process
+      1. Read the prompt to understand the research goal
+      2. Identify 2-5 independent sub-questions
+      3. Each question should be self-contained and answerable independently
+      4. Dispatch as a wave:
+
+      ```bash
+      ralph wave emit research.question --payloads \
+        "What error types exist in the codebase?" \
+        "How are errors propagated across async boundaries?" \
+        "What recovery strategies are used?"
+      ```
+
+      ### Constraints
+      - Questions must be independent (no question depends on another's answer)
+      - 2-5 questions per wave (not too many, not too few)
+      - Each question should be specific enough to investigate in one session
+
+  researcher:
+    name: "🔬 Researcher"
+    description: "Investigates a single research question by exploring code and documentation."
+    triggers: ["research.question"]
+    publishes: ["research.finding"]
+    concurrency: 3
+    instructions: |
+      ## RESEARCHER MODE — Investigate One Question
+
+      You investigate exactly one research question. Be thorough and cite sources.
+
+      ### Process
+      1. Read your assigned question
+      2. Search the codebase for relevant code, patterns, and docs
+      3. Analyze findings and draw conclusions
+      4. Publish structured findings
+
+      ```bash
+      ralph emit research.finding "## Question\n...\n\n## Findings\n...\n\n## Evidence\n..."
+      ```
+
+      ### Constraints
+      - Focus ONLY on your assigned question
+      - Cite specific file paths and line numbers
+      - Include code examples where relevant
+      - Distinguish observations from interpretations
+
+  synthesizer:
+    name: "📝 Synthesizer"
+    description: "Combines parallel research findings into a coherent report."
+    triggers: ["research.finding"]
+    publishes: ["research.complete"]
+    aggregate:
+      mode: wait_for_all
+      timeout: 300
+    instructions: |
+      ## SYNTHESIZER MODE — Combine Research Findings
+
+      Merge all research findings into a coherent, actionable report.
+
+      ### Process
+      1. Read all research.finding events
+      2. Identify common themes and contradictions
+      3. Synthesize into a structured report
+      4. Write to `.ralph/agent/research-report.md`
+      5. Publish research.complete
+
+      ### Report Structure
+      ```markdown
+      # Research Report: [Topic]
+
+      ## Executive Summary
+      Key findings in 3-5 bullet points.
+
+      ## Detailed Findings
+      Organized by theme, not by question.
+
+      ## Recommendations
+      Actionable next steps based on findings.
+
+      ## References
+      Files and resources cited.
+      ```

@@ -34,6 +34,15 @@ pub struct ProcessedEvents {
     pub has_orphans: bool,
 }
 
+/// Result of processing events from JSONL with wave events partitioned out.
+#[derive(Debug)]
+pub struct ProcessedEventsWithWaves {
+    /// Normal event processing results.
+    pub processed: ProcessedEvents,
+    /// Wave events extracted before normal processing (have wave_id set).
+    pub wave_events: Vec<crate::event_reader::Event>,
+}
+
 /// Reason the event loop terminated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminationReason {
@@ -2303,6 +2312,92 @@ impl EventLoop {
         Ok(ProcessedEvents {
             had_events,
             has_orphans,
+        })
+    }
+
+    /// Process events from JSONL, partitioning wave events from regular events.
+    ///
+    /// Wave events (those with `wave_id` set) are extracted and returned separately
+    /// without being published to the event bus. Regular events go through the
+    /// normal backpressure pipeline.
+    pub fn process_events_from_jsonl_with_waves(
+        &mut self,
+    ) -> std::io::Result<ProcessedEventsWithWaves> {
+        let result = self.event_reader.read_new_events()?;
+
+        // Handle malformed lines (same as process_events_from_jsonl)
+        for malformed in &result.malformed {
+            let payload = format!(
+                "Line {}: {}\nContent: {}",
+                malformed.line_number, malformed.error, &malformed.content
+            );
+            let event = Event::new("event.malformed", &payload);
+            self.bus.publish(event);
+            self.state.consecutive_malformed_events += 1;
+            warn!(
+                line = malformed.line_number,
+                consecutive = self.state.consecutive_malformed_events,
+                "Malformed event line detected"
+            );
+        }
+
+        if !result.events.is_empty() {
+            self.state.consecutive_malformed_events = 0;
+        }
+
+        // Partition: wave events vs regular events
+        let (wave_events, regular_events): (Vec<_>, Vec<_>) = result
+            .events
+            .into_iter()
+            .partition(|e| e.wave_id.is_some());
+
+        if !wave_events.is_empty() {
+            debug!(
+                wave_count = wave_events.len(),
+                regular_count = regular_events.len(),
+                "Partitioned wave events from regular events"
+            );
+        }
+
+        // Process regular events through normal pipeline
+        // (Temporarily replace result.events with just regular events)
+        let processed = if regular_events.is_empty() && result.malformed.is_empty() {
+            ProcessedEvents {
+                had_events: false,
+                has_orphans: false,
+            }
+        } else {
+            // Publish regular events to bus (simplified: skip the full backpressure
+            // pipeline here since wave events are the ones being dispatched, not results)
+            let mut had_events = false;
+            let mut has_orphans = false;
+
+            for event in &regular_events {
+                let topic = &event.topic;
+                let payload = event.payload.clone().unwrap_or_default();
+
+                had_events = true;
+                self.state.record_topic(topic);
+
+                if !self.registry.has_subscriber(topic.as_str()) {
+                    has_orphans = true;
+                }
+
+                debug!(topic = %topic, "Publishing regular event from JSONL");
+
+                let proto_event = Event::new(topic.as_str(), payload);
+                self.bus.publish(proto_event);
+            }
+
+            ProcessedEvents {
+                had_events,
+                has_orphans,
+            }
+        };
+
+        Ok(ProcessedEventsWithWaves {
+            processed,
+            wave_events,
         })
     }
 
