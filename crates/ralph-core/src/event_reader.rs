@@ -92,6 +92,25 @@ pub struct Event {
     )]
     pub payload: Option<String>,
     pub ts: String,
+
+    /// Wave correlation ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave_id: Option<String>,
+
+    /// Index of this event within the wave (0-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave_index: Option<u32>,
+
+    /// Total number of events in the wave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave_total: Option<u32>,
+}
+
+impl Event {
+    /// Returns true if this event has wave correlation metadata.
+    pub fn is_wave_event(&self) -> bool {
+        self.wave_id.is_some()
+    }
 }
 
 /// Reads new events from `.ralph/events.jsonl` since last read.
@@ -400,6 +419,86 @@ mod tests {
         assert_eq!(parsed["issues"][0]["file"], "test.rs");
         assert_eq!(parsed["issues"][0]["line"], 42);
         assert_eq!(parsed["approval"], "conditional");
+    }
+
+    #[test]
+    fn test_event_reader_parses_wave_metadata() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"topic":"review.file","payload":"src/main.rs","ts":"2024-01-01T00:00:00Z","wave_id":"w-1a2b3c4d","wave_index":0,"wave_total":3}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"topic":"review.file","payload":"src/lib.rs","ts":"2024-01-01T00:00:00Z","wave_id":"w-1a2b3c4d","wave_index":1,"wave_total":3}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let mut reader = EventReader::new(file.path());
+        let result = reader.read_new_events().unwrap();
+
+        assert_eq!(result.events.len(), 2);
+        assert!(result.events[0].is_wave_event());
+        assert_eq!(result.events[0].wave_id.as_deref(), Some("w-1a2b3c4d"));
+        assert_eq!(result.events[0].wave_index, Some(0));
+        assert_eq!(result.events[0].wave_total, Some(3));
+        assert_eq!(result.events[1].wave_index, Some(1));
+    }
+
+    #[test]
+    fn test_event_reader_backwards_compat_no_wave_fields() {
+        // Events written before wave support should still parse
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"topic":"build.done","payload":"ok","ts":"2024-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let mut reader = EventReader::new(file.path());
+        let result = reader.read_new_events().unwrap();
+
+        assert_eq!(result.events.len(), 1);
+        assert!(!result.events[0].is_wave_event());
+        assert!(result.events[0].wave_id.is_none());
+        assert!(result.events[0].wave_index.is_none());
+        assert!(result.events[0].wave_total.is_none());
+    }
+
+    #[test]
+    fn test_event_reader_mixed_wave_and_non_wave() {
+        let mut file = NamedTempFile::new().unwrap();
+        // Non-wave event
+        writeln!(
+            file,
+            r#"{{"topic":"task.start","payload":"begin","ts":"2024-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        // Wave event
+        writeln!(
+            file,
+            r#"{{"topic":"review.file","payload":"src/main.rs","ts":"2024-01-01T00:00:01Z","wave_id":"w-abc","wave_index":0,"wave_total":2}}"#
+        )
+        .unwrap();
+        // Another non-wave event
+        writeln!(
+            file,
+            r#"{{"topic":"build.done","ts":"2024-01-01T00:00:02Z"}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let mut reader = EventReader::new(file.path());
+        let result = reader.read_new_events().unwrap();
+
+        assert_eq!(result.events.len(), 3);
+        assert!(!result.events[0].is_wave_event());
+        assert!(result.events[1].is_wave_event());
+        assert_eq!(result.events[1].wave_id.as_deref(), Some("w-abc"));
+        assert!(!result.events[2].is_wave_event());
     }
 
     #[test]

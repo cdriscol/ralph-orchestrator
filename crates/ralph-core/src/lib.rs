@@ -50,6 +50,7 @@ pub mod task_store;
 pub mod testing;
 mod text;
 pub mod utils;
+pub mod wave_tracker;
 pub mod workspace;
 pub mod worktree;
 
@@ -113,6 +114,7 @@ pub use task_definition::{
 };
 pub use task_store::TaskStore;
 pub use text::{floor_char_boundary, truncate_with_ellipsis};
+pub use wave_tracker::{CompletedWave, WaveFailure, WaveProgress, WaveResult, WaveState, WaveTracker};
 pub use workspace::{
     CleanupPolicy, TaskWorkspace, VerificationResult, WorkspaceError, WorkspaceInfo,
     WorkspaceManager,

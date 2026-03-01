@@ -1046,6 +1046,8 @@ fn test_default_publishes_injects_when_no_events() {
             default_publishes: Some("task.done".to_string()),
             max_activations: None,
             disallowed_tools: vec![],
+            concurrency: 1,
+            aggregate: None,
         },
     );
     config.hats = hats;
@@ -1100,6 +1102,8 @@ fn test_default_publishes_not_injected_when_events_written() {
             default_publishes: Some("task.done".to_string()),
             max_activations: None,
             disallowed_tools: vec![],
+            concurrency: 1,
+            aggregate: None,
         },
     );
     config.hats = hats;
@@ -1165,6 +1169,8 @@ fn test_default_publishes_skipped_when_non_orphan_event_written() {
             default_publishes: Some("task.done".to_string()),
             max_activations: None,
             disallowed_tools: vec![],
+            concurrency: 1,
+            aggregate: None,
         },
     );
     config.hats = hats;
@@ -1232,6 +1238,8 @@ fn test_default_publishes_not_injected_when_not_configured() {
             default_publishes: None, // No default configured
             max_activations: None,
             disallowed_tools: vec![],
+            concurrency: 1,
+            aggregate: None,
         },
     );
     config.hats = hats;
@@ -3631,6 +3639,8 @@ fn test_default_publishes_satisfies_required_events_for_completion() {
             default_publishes: Some("plan.draft".to_string()),
             max_activations: None,
             disallowed_tools: vec![],
+            concurrency: 1,
+            aggregate: None,
         },
     );
     config.hats = hats;
@@ -3685,6 +3695,8 @@ fn test_default_publishes_completion_promise_triggers_termination() {
             default_publishes: Some("LOOP_COMPLETE".to_string()),
             max_activations: None,
             disallowed_tools: vec![],
+            concurrency: 1,
+            aggregate: None,
         },
     );
     config.hats = hats;
