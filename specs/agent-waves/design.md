@@ -13,6 +13,16 @@ Waves are built on three primitives inspired by Enterprise Integration Patterns:
 
 Source: https://github.com/mikeyobrien/ralph-orchestrator/issues/210
 
+### Why not just spawn subagents?
+
+An agent could spawn N backends in a single step and collect results — no new infrastructure needed. Waves add value in two specific ways:
+
+1. **Wall-clock time.** This is the primary motivation. 5 file reviews at 2 minutes each: sequential is 10 minutes, concurrent is 2. For multi-hat presets, sequential execution is the dominant bottleneck. Waves eliminate it.
+
+2. **Fresh context for synthesis.** When N workers each produce substantial output, an in-context approach forces the dispatching agent to hold all results in one context window. Waves route results to a dedicated aggregator hat that activates in a fresh iteration — purpose-built instructions, no context pressure from the dispatch phase.
+
+The concurrent execution is the real value. The event plumbing (per-worker files, env vars, correlation metadata) is what makes it work correctly within Ralph's existing architecture.
+
 ---
 
 ## Architectural Impact
