@@ -69,7 +69,6 @@ This is a deliberate, bounded exception to the Hatless Ralph model:
 
 **Deferred to v2+:**
 - `ralph wave start`/`ralph wave end` (incremental wave emission)
-- Worktree isolation (`isolation: worktree`)
 - Nested waves
 - Additional aggregation modes (`first_n`, `quorum`, `external_event`)
 - Configurable failure modes (`on_failure: fail_fast`)
@@ -865,11 +864,31 @@ Waves fill the lightweight case: intra-loop fan-out where instances are read-hea
 
 A "parallel loops without worktrees" option would give the danger of shared-workspace concurrent writes without the guardrails waves provide (targeted single-hat activations, aggregation, Ralph deciding what's safe to parallelize).
 
-### Wave v2 worktree isolation is unnecessary
+### Worktree isolation is not needed for v1
 
-The original design deferred worktree isolation for wave instances to v2. However, if a wave instance needs full filesystem and branch isolation, that's the parallel loops use case — use parallel loops instead. Waves are for the lightweight case where isolation isn't needed. Two sharp tools instead of one blurry one.
+v1 waves use shared workspace only — zero overhead, sufficient for read-heavy and write-disjoint workloads. Parallel loops cover the write-heavy case today.
 
-The two features compose: a worktree parallel loop can internally use waves for subtask parallelism within its own orchestration run.
+### Future: `isolation: worktree` could unify both features
+
+If waves gained per-hat worktree isolation (`isolation: worktree`), they could subsume parallel loops entirely. A wave worker running in its own worktree with its own git branch is functionally equivalent to a parallel loop — the only difference is orchestration model (parent-child vs peer-to-peer).
+
+The core insight: parallel loops aren't really a parallelism feature — they're a **filesystem isolation feature** that happens to enable parallelism. The actual parallelism primitive is waves. If waves can optionally isolate at the filesystem level, the separate parallel loops system becomes redundant.
+
+```yaml
+# Future: wave worker with worktree isolation
+hats:
+  implementer:
+    triggers: ["task.implement"]
+    publishes: ["task.done"]
+    concurrency: 3
+    isolation: worktree    # each instance gets its own worktree + branch
+    instructions: |
+      Implement the assigned task. Commit your changes.
+```
+
+This is deferred until waves prove out in practice. The migration path would be: ship waves v1 (shared workspace) → validate the orchestration model → add `isolation: worktree` → deprecate parallel loops as a separate feature.
+
+The remaining gap is ad-hoc user initiation (`ralph run` in a second terminal). This could be addressed with something like `ralph run -p "task" --join <loop-id>` to attach as a wave instance to an existing loop, but that's a UX question for later.
 
 ---
 
@@ -1211,7 +1230,7 @@ Key findings from codebase research (full details in `research/` directory):
 
 4. **HATS table** already resolves `publishes` → downstream hats with descriptions and Mermaid flowcharts. Context injection for NL dispatch extends this existing mechanism.
 
-5. **Worktree infrastructure** exists and is reusable for future `isolation: worktree` but is intentionally deferred from v1.
+5. **Worktree infrastructure** exists for parallel loops but is not needed for waves — waves use shared workspace, and write-heavy parallel work should use parallel loops instead.
 
 ### C. Alternative Approaches Considered
 
@@ -1221,14 +1240,14 @@ Key findings from codebase research (full details in `research/` directory):
 | Loop-runner-only parallelism (Q1:C) | Kills NL-driven adaptive dispatch, the key differentiator from static config |
 | Lightweight wave instances (Q2:B) | Violates "agents are smart, let them do the work" — prescribes capability limits |
 | Dedicated aggregator backend (Q3:B) | Premature optimization — Ralph-as-aggregator handles common cases, dedicated backend is v2 |
-| Worktree isolation in v1 (Q5:B) | Disproportionate complexity for primarily read-heavy v1 use cases |
+| Worktree isolation for waves in v1 (Q5:B) | Deferred — not needed for v1. Could eventually unify waves and parallel loops (see "Relationship to Parallel Loops") |
 | Fail-fast failure mode (Q6:A) | Partial results are almost always useful; one failure shouldn't waste the whole wave |
 | Wave = one activation (Q7:B) | Hides real resource usage from users; breaks max_activations budget contract |
 
 ### D. Future Extensions (v2+)
 
+- **Worktree isolation** (`isolation: worktree`): per-wave-instance worktree for write-heavy parallel work. Could unify waves and parallel loops into a single parallelism primitive — see "Relationship to Parallel Loops" section
 - **Incremental wave emission**: `ralph wave start`/`ralph wave end` for dynamic wave sizing (when the dispatcher doesn't know the count upfront)
-- ~~**Worktree isolation**~~: Removed — write-heavy parallel work should use parallel loops instead. See "Relationship to Parallel Loops" section
 - **Nested waves**: wave workers emitting sub-waves for hierarchical decomposition
 - **Additional aggregation modes**: `first_n` (activate after N results), `quorum` (majority), `external_event` (wait for external signal)
 - **Configurable failure modes**: `on_failure: fail_fast | best_effort`
