@@ -1,10 +1,10 @@
-# Wave Review: Scatter-Gather Parallel Code Review
-# Pattern: Dispatch files to parallel reviewers, aggregate findings
+# Wave Review: Parallel Specialized Code Review
+# Pattern: Dispatch specialized review perspectives as a wave, synthesize findings
 #
 # 3 Hats:
-# - Dispatcher: Identifies files to review and dispatches wave
-# - Reviewer: Reviews individual files in parallel (concurrency: 4)
-# - Synthesizer: Aggregates review findings into final report
+# - Coordinator: Reads the prompt and dispatches specialized reviewers as a wave
+# - Reviewer: Specialized reviewer running in parallel (concurrency: 3)
+# - Synthesizer: Aggregates findings from all reviewers into final report
 #
 # Usage:
 #   ralph run --hats presets/wave-review.yml --prompt "Review the authentication module"
@@ -21,68 +21,74 @@ cli:
 
 core:
   guardrails:
-    - "Each reviewer focuses on one file — do not review other files"
+    - "Each reviewer stays in their specialty — do not review outside your domain"
     - "Be specific: cite line numbers and concrete improvements"
     - "Distinguish critical issues from suggestions"
 
 hats:
-  dispatcher:
-    name: "📋 Dispatcher"
-    description: "Identifies review targets and dispatches a wave of file reviews."
+  coordinator:
+    name: "📋 Coordinator"
+    description: "Reads the review scope and dispatches specialized reviewers as a wave."
     triggers: ["review.start"]
-    publishes: ["review.file"]
+    publishes: ["review.perspective"]
     instructions: |
-      ## DISPATCHER MODE — Identify and Dispatch Review Targets
+      ## COORDINATOR MODE — Dispatch Specialized Reviewers
 
-      Analyze the prompt to determine what to review, then dispatch files as a wave.
+      Analyze the prompt to determine what to review, then dispatch specialized
+      review perspectives as a wave. Each payload should describe the reviewer's
+      specialty and what to focus on.
 
       ### Process
       1. Read the prompt to understand review scope
-      2. Identify relevant files (use git diff, file listing, etc.)
-      3. Filter to meaningful files (skip generated, vendored, lock files)
-      4. Dispatch via wave:
+      2. Identify what files and areas are involved
+      3. Dispatch specialized reviewers as a wave:
 
       ```bash
-      ralph wave emit review.file --payloads "path/to/file1.rs" "path/to/file2.rs" "path/to/file3.rs"
+      ralph wave emit review.perspective --payloads \
+        "ROLE: Rust Reviewer. Focus on idiomatic Rust, ownership/borrowing correctness, error handling with Result/Option, unsafe usage, performance (allocations, cloning), and Clippy-level issues. Review all .rs files in scope." \
+        "ROLE: Frontend Reviewer. Focus on React component patterns, accessibility (a11y), CSS/Tailwind usage, state management, bundle size impact, and browser compatibility. Review all frontend code in scope." \
+        "ROLE: Documentation Reviewer. Focus on README accuracy, doc comment coverage, API documentation completeness, example correctness, changelog entries, and user-facing messaging. Review all docs and comments in scope."
       ```
 
       ### Constraints
-      - Dispatch ALL relevant files in a single wave
-      - Include file paths as payloads (reviewers will read them)
-      - Skip test fixtures, generated code, and lock files
+      - Always dispatch at least 2 specialized reviewers
+      - Each payload must clearly state the reviewer's ROLE and FOCUS area
+      - Tailor the specialties to the code being reviewed
+      - You may substitute or add specialties (e.g., Security, Database, API Design) based on what's relevant
 
   reviewer:
     name: "🔍 Reviewer"
-    description: "Reviews a single file for bugs, style, and improvements."
-    triggers: ["review.file"]
+    description: "A specialized reviewer examining code from one expert perspective."
+    triggers: ["review.perspective"]
     publishes: ["review.done"]
-    concurrency: 4
+    concurrency: 3
     instructions: |
-      ## REVIEWER MODE — Single File Review
+      ## REVIEWER MODE — Specialized Review
 
-      You review exactly one file. Focus and thoroughness are your strengths.
+      You are a specialized code reviewer. Your payload describes your ROLE and
+      FOCUS area. Review the codebase strictly from that perspective.
 
-      ### Review Checklist
-      1. **Read the file** — understand its purpose and context
-      2. **Check for bugs** — logic errors, edge cases, null handling
-      3. **Check for style** — naming, formatting, idiomatic patterns
-      4. **Check for security** — injection, validation, auth issues
-      5. **Check for performance** — unnecessary allocations, N+1 queries
+      ### Process
+      1. Read your assigned role and focus area from the event payload
+      2. Identify files relevant to your specialty
+      3. Review thoroughly from your expert perspective
+      4. Publish structured findings
 
       ### Output Format
       Publish your findings:
       ```bash
-      ralph emit review.done "## file.rs\n\n### Critical\n- ...\n\n### Suggestions\n- ..."
+      ralph emit review.done "## [Your Role]\n\n### Critical\n- ...\n\n### Warnings\n- ...\n\n### Suggestions\n- ..."
       ```
 
       ### Constraints
-      - Review ONLY your assigned file
-      - Be specific: cite line numbers
+      - Stay in your lane: only review from your assigned perspective
+      - Be specific: cite file paths and line numbers
       - Distinguish critical issues from nice-to-haves
+      - If your specialty has no relevant code in scope, say so briefly
 
   synthesizer:
     name: "📊 Synthesizer"
-    description: "Aggregates parallel review findings into a unified report."
+    description: "Aggregates findings from all specialized reviewers into a unified report."
     triggers: ["review.done"]
     publishes: ["review.complete"]
     aggregate:
@@ -91,31 +97,37 @@ hats:
     instructions: |
       ## SYNTHESIZER MODE — Aggregate Review Findings
 
-      Collect all review results and produce a unified report.
+      Collect all specialized review results and produce a unified report.
 
       ### Process
       1. Read all review.done events from the pending events
       2. Categorize findings by severity (Critical / Warning / Suggestion)
-      3. Identify cross-cutting themes
-      4. Write the report to `.ralph/agent/review-report.md`
-      5. Publish review.complete
+      3. Note where multiple reviewers flagged the same area
+      4. Identify cross-cutting themes
+      5. Write the report to `.ralph/agent/review-report.md`
+      6. Publish review.complete
 
       ### Report Format
       ```markdown
       # Code Review Report
 
       ## Summary
-      - Files reviewed: N
+      - Reviewers: [list specialties]
       - Critical issues: N
       - Warnings: N
       - Suggestions: N
 
       ## Critical Issues
-      ...
+      Issues that must be fixed before merge.
 
       ## Cross-Cutting Themes
-      ...
+      Patterns noticed by multiple reviewers.
 
-      ## Per-File Details
+      ## Per-Reviewer Details
+      ### Rust Review
+      ...
+      ### Frontend Review
+      ...
+      ### Documentation Review
       ...
       ```
