@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::http::{HeaderMap, StatusCode};
-use chrono::{SecondsFormat, Utc};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -95,7 +94,7 @@ impl RpcRuntime {
     pub fn health_payload(&self) -> Value {
         json!({
             "status": "ok",
-            "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+            "timestamp": crate::loop_support::now_ts()
         })
     }
 
@@ -295,14 +294,15 @@ impl RpcRuntime {
         })?;
 
         if !is_known_method(&method) {
-            return Err(ApiError::method_not_found(method.clone())
-                .with_context(request_id.clone(), Some(method)));
+            return Err(
+                ApiError::method_not_found(method.clone()).with_context(request_id, Some(method))
+            );
         }
 
         if let Err(errors) = validate_request_schema(&raw) {
             return Err(
                 ApiError::invalid_params("request does not match rpc-v1 schema")
-                    .with_context(request_id.clone(), Some(method.clone()))
+                    .with_context(request_id, Some(method))
                     .with_details(json!({ "errors": errors })),
             );
         }

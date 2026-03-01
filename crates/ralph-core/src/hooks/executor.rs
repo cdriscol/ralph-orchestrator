@@ -241,13 +241,31 @@ impl HookExecutorContract for HookExecutor {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let mut child = command.spawn().map_err(|source| HookExecutorError::Spawn {
-            phase_event: request.phase_event.clone(),
-            hook_name: request.hook_name.clone(),
-            command: command_display.clone(),
-            cwd: resolved_cwd.display().to_string(),
-            source,
-        })?;
+        // Retry on ETXTBSY: the kernel defers fput() from close(), so exec()
+        // can briefly see a stale write-count on the inode. A single retry
+        // after yielding the thread is sufficient for the task_work to drain.
+        let mut child = None;
+        for attempt in 0..3 {
+            match command.spawn() {
+                Ok(c) => {
+                    child = Some(c);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(26 /* ETXTBSY */) && attempt < 2 => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(source) => {
+                    return Err(HookExecutorError::Spawn {
+                        phase_event: request.phase_event.clone(),
+                        hook_name: request.hook_name.clone(),
+                        command: command_display,
+                        cwd: resolved_cwd.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+        let mut child = child.expect("spawn loop must break or return");
 
         write_stdin_payload(
             &mut child,
@@ -623,30 +641,34 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use tempfile::{TempDir, tempdir};
 
     fn write_executable_script(temp_dir: &TempDir, file_name: &str, body: &str) -> PathBuf {
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
 
         let script_path = temp_dir.path().join(file_name);
         let script = format!("#!/bin/sh\nset -eu\n{body}\n");
 
-        // Explicit open/write/sync/close to avoid ETXTBSY on CI:
-        // the kernel may reject exec() if the write fd isn't fully closed.
+        // Set mode at creation time and sync before close to avoid the
+        // ETXTBSY race (deferred fput between close and exec).
         {
-            let mut file = fs::File::create(&script_path).expect("create script file");
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&script_path)
+                .expect("create script file");
             file.write_all(script.as_bytes())
                 .expect("write script file");
             file.sync_all().expect("sync script file");
         }
 
-        let mut permissions = fs::metadata(&script_path)
-            .expect("read script metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("set script permissions");
+        // Force the kernel to process the deferred fput from close() above
+        // by issuing another syscall that touches the same inode.
+        let _ = fs::metadata(&script_path).expect("stat script");
 
         script_path
     }

@@ -175,8 +175,8 @@ ralph hooks <COMMAND>
 Try it against the minimal sample hooks config:
 
 - `ralph hooks validate -c examples/hooks/minimal/ralph.hooks.yml`
-- Config: [`examples/hooks/minimal/ralph.hooks.yml`](../../examples/hooks/minimal/ralph.hooks.yml)
-- Scripts: [`examples/hooks/scripts/env-guard.sh`](../../examples/hooks/scripts/env-guard.sh), [`examples/hooks/scripts/notify.sh`](../../examples/hooks/scripts/notify.sh)
+- Config: [`examples/hooks/minimal/ralph.hooks.yml`](https://github.com/mikeyobrien/ralph-orchestrator/blob/main/examples/hooks/minimal/ralph.hooks.yml)
+- Scripts: [`examples/hooks/scripts/env-guard.sh`](https://github.com/mikeyobrien/ralph-orchestrator/blob/main/examples/hooks/scripts/env-guard.sh), [`examples/hooks/scripts/notify.sh`](https://github.com/mikeyobrien/ralph-orchestrator/blob/main/examples/hooks/scripts/notify.sh)
 
 ### ralph doctor
 

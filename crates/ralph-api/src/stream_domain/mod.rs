@@ -4,12 +4,13 @@ mod rpc_side_effects;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::errors::ApiError;
+use crate::loop_support::now_ts;
 use crate::protocol::{API_VERSION, STREAM_NAME, STREAM_TOPICS};
 
 use self::filters::{
@@ -457,8 +458,4 @@ fn next_event(
         },
         payload,
     }
-}
-
-fn now_ts() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }

@@ -266,8 +266,8 @@ Mutation scope in v1 is intentionally narrow:
 
 Minimal runnable example:
 
-- Config: [`examples/hooks/minimal/ralph.hooks.yml`](../../examples/hooks/minimal/ralph.hooks.yml)
-- Scripts: [`examples/hooks/scripts/env-guard.sh`](../../examples/hooks/scripts/env-guard.sh), [`examples/hooks/scripts/notify.sh`](../../examples/hooks/scripts/notify.sh)
+- Config: [`examples/hooks/minimal/ralph.hooks.yml`](https://github.com/mikeyobrien/ralph-orchestrator/blob/main/examples/hooks/minimal/ralph.hooks.yml)
+- Scripts: [`examples/hooks/scripts/env-guard.sh`](https://github.com/mikeyobrien/ralph-orchestrator/blob/main/examples/hooks/scripts/env-guard.sh), [`examples/hooks/scripts/notify.sh`](https://github.com/mikeyobrien/ralph-orchestrator/blob/main/examples/hooks/scripts/notify.sh)
 - Validate: `ralph hooks validate -c examples/hooks/minimal/ralph.hooks.yml`
 
 ### hats

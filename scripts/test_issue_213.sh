@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Manual regression test for issue #213
 # Run this script to verify the fix for "Subprocess TUI run wrongly spawns worktree on first run"
 #
