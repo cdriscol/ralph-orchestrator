@@ -362,6 +362,14 @@ pub enum RpcEvent {
         payload_preview: String,
     },
 
+    /// Streaming text delta from a wave worker.
+    WaveWorkerTextDelta {
+        /// Zero-based worker index.
+        worker_index: u32,
+        /// The text chunk.
+        delta: String,
+    },
+
     /// All wave workers have completed.
     WaveCompleted {
         /// Number of successful workers.

@@ -117,12 +117,34 @@ pub enum GuidanceResult {
 // WaveInfo - Active wave tracking for TUI header display
 // ============================================================================
 
-/// Tracks active wave execution for header display.
+/// Tracks active wave execution for header display and per-worker output.
 pub struct WaveInfo {
     pub hat_name: String,
     pub total: u32,
     pub completed: u32,
     pub started_at: Instant,
+    /// Per-worker output buffers (indexed by worker_index).
+    pub worker_buffers: Vec<IterationBuffer>,
+}
+
+impl WaveInfo {
+    /// Creates a new WaveInfo with N empty worker buffers.
+    pub fn new(hat_name: String, total: u32) -> Self {
+        let worker_buffers = (0..total)
+            .map(|i| {
+                let mut buf = IterationBuffer::new(i + 1);
+                buf.hat_display = Some(format!("Worker {}/{}", i + 1, total));
+                buf
+            })
+            .collect();
+        Self {
+            hat_name,
+            total,
+            completed: 0,
+            started_at: Instant::now(),
+            worker_buffers,
+        }
+    }
 }
 
 /// Observable state derived from loop events.
@@ -202,6 +224,12 @@ pub struct TuiState {
     // ========================================================================
     /// Active wave info for header display.
     pub wave_active: Option<WaveInfo>,
+    /// Preserved wave buffers after wave completes (cleared on next IterationStart).
+    pub wave_completed_buffers: Option<WaveInfo>,
+    /// Whether the wave worker drill-down view is active.
+    pub wave_view_active: bool,
+    /// Index of the worker currently being viewed in wave view (0-indexed).
+    pub wave_view_index: usize,
 
     // ========================================================================
     // Guidance State
@@ -273,6 +301,9 @@ impl TuiState {
             active_task: None,
             // Wave state
             wave_active: None,
+            wave_completed_buffers: None,
+            wave_view_active: false,
+            wave_view_index: 0,
             // Guidance state
             guidance_mode: None,
             guidance_input: String::new(),
@@ -322,6 +353,9 @@ impl TuiState {
             active_task: None,
             // Wave state
             wave_active: None,
+            wave_completed_buffers: None,
+            wave_view_active: false,
+            wave_view_index: 0,
             // Guidance state
             guidance_mode: None,
             guidance_input: String::new(),
@@ -535,6 +569,10 @@ impl TuiState {
         // Reset text accumulation buffer for the new iteration
         self.rpc_text_buffer.clear();
         self.rpc_text_line_count = 0;
+
+        // Clear completed wave buffers and exit wave view on new iteration
+        self.wave_completed_buffers = None;
+        self.wave_view_active = false;
 
         let hat_display = hat_display.or_else(|| {
             self.pending_hat
@@ -877,6 +915,76 @@ impl TuiState {
                 None
             }
         })
+    }
+
+    // ========================================================================
+    // Wave View Methods
+    // ========================================================================
+
+    /// Returns the WaveInfo to use for wave view (active or completed).
+    fn wave_info_for_view(&self) -> Option<&WaveInfo> {
+        self.wave_active
+            .as_ref()
+            .or(self.wave_completed_buffers.as_ref())
+    }
+
+    /// Returns the WaveInfo to use for wave view (mutable).
+    fn wave_info_for_view_mut(&mut self) -> Option<&mut WaveInfo> {
+        if self.wave_active.is_some() {
+            self.wave_active.as_mut()
+        } else {
+            self.wave_completed_buffers.as_mut()
+        }
+    }
+
+    /// Enters wave worker drill-down view. No-op if no wave data exists.
+    pub fn enter_wave_view(&mut self) {
+        if self.wave_info_for_view().is_some() {
+            self.wave_view_active = true;
+            self.wave_view_index = 0;
+        }
+    }
+
+    /// Exits wave worker drill-down view.
+    pub fn exit_wave_view(&mut self) {
+        self.wave_view_active = false;
+    }
+
+    /// Cycles to the next worker in wave view.
+    pub fn wave_view_next(&mut self) {
+        if let Some(wave) = self.wave_info_for_view() {
+            let total = wave.worker_buffers.len();
+            if total > 0 {
+                self.wave_view_index = (self.wave_view_index + 1) % total;
+            }
+        }
+    }
+
+    /// Cycles to the previous worker in wave view.
+    pub fn wave_view_prev(&mut self) {
+        if let Some(wave) = self.wave_info_for_view() {
+            let total = wave.worker_buffers.len();
+            if total > 0 {
+                if self.wave_view_index == 0 {
+                    self.wave_view_index = total - 1;
+                } else {
+                    self.wave_view_index -= 1;
+                }
+            }
+        }
+    }
+
+    /// Returns the current wave worker buffer (immutable) for rendering.
+    pub fn current_wave_worker_buffer(&self) -> Option<&IterationBuffer> {
+        self.wave_info_for_view()
+            .and_then(|w| w.worker_buffers.get(self.wave_view_index))
+    }
+
+    /// Returns the current wave worker buffer (mutable) for scrolling.
+    pub fn current_wave_worker_buffer_mut(&mut self) -> Option<&mut IterationBuffer> {
+        let idx = self.wave_view_index;
+        self.wave_info_for_view_mut()
+            .and_then(|w| w.worker_buffers.get_mut(idx))
     }
 }
 

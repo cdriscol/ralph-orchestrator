@@ -34,7 +34,25 @@ pub fn render(state: &TuiState, width: u16) -> Paragraph<'static> {
     let mut spans = vec![];
 
     // Priority 1: Iteration counter or status indicator - ALWAYS shown
-    if state.subprocess_error.is_some() {
+    if state.wave_view_active {
+        // Wave view: show [worker N/M] instead of [iter N/M]
+        let total = state
+            .current_wave_worker_buffer()
+            .map(|_| {
+                state
+                    .wave_active
+                    .as_ref()
+                    .or(state.wave_completed_buffers.as_ref())
+                    .map(|w| w.total)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let worker_display = format!("[worker {}/{}]", state.wave_view_index + 1, total);
+        spans.push(Span::styled(
+            worker_display,
+            Style::default().fg(Color::Magenta),
+        ));
+    } else if state.subprocess_error.is_some() {
         spans.push(Span::styled(
             "[ERROR]".to_string(),
             Style::default().fg(Color::Red),
@@ -119,9 +137,15 @@ pub fn render(state: &TuiState, width: u16) -> Paragraph<'static> {
     }
 
     // Priority 2: Mode indicator - ALWAYS shown (compressed at WIDTH_COMPRESS and below)
-    // Shows [LIVE] when following latest iteration, [REVIEW] when viewing history
+    // Shows [WAVE] in wave view, [LIVE] when following latest, [REVIEW] when viewing history
     spans.push(Span::raw(" | "));
-    let mode = if state.following_latest {
+    let mode = if state.wave_view_active {
+        if width > WIDTH_COMPRESS {
+            Span::styled("[WAVE]", Style::default().fg(Color::Magenta))
+        } else {
+            Span::styled("W", Style::default().fg(Color::Magenta))
+        }
+    } else if state.following_latest {
         if width > WIDTH_COMPRESS {
             Span::styled("[LIVE]", Style::default().fg(Color::Green))
         } else {

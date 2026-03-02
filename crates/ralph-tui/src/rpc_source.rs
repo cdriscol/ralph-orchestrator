@@ -414,12 +414,7 @@ fn apply_rpc_event(event: &RpcEvent, state: &Arc<Mutex<TuiState>>, acc: &mut Tex
             worker_count,
             timeout_secs,
         } => {
-            s.wave_active = Some(WaveInfo {
-                hat_name: hat_name.clone(),
-                total: *worker_count,
-                completed: 0,
-                started_at: Instant::now(),
-            });
+            s.wave_active = Some(WaveInfo::new(hat_name.clone(), *worker_count));
             let line = Line::from(vec![
                 Span::styled("── WAVE: ", Style::default().fg(Color::Magenta)),
                 Span::styled(
@@ -474,12 +469,29 @@ fn apply_rpc_event(event: &RpcEvent, state: &Arc<Mutex<TuiState>>, acc: &mut Tex
             s.last_event_at = Some(Instant::now());
         }
 
+        RpcEvent::WaveWorkerTextDelta {
+            worker_index,
+            delta,
+        } => {
+            if let Some(ref wave) = s.wave_active
+                && let Some(buffer) = wave.worker_buffers.get(*worker_index as usize)
+            {
+                let handle = buffer.lines_handle();
+                if let Ok(mut lines) = handle.lock() {
+                    // Append rendered text lines from the delta
+                    lines.extend(text_to_lines(delta));
+                }
+            }
+            s.last_event = Some("wave_worker_text_delta".to_string());
+            s.last_event_at = Some(Instant::now());
+        }
+
         RpcEvent::WaveCompleted {
             succeeded,
             failed,
             duration_ms,
         } => {
-            s.wave_active = None;
+            s.wave_completed_buffers = s.wave_active.take();
             let secs = *duration_ms / 1000;
             let color = if *failed > 0 { Color::Yellow } else { Color::Green };
             let line = Line::from(Span::styled(

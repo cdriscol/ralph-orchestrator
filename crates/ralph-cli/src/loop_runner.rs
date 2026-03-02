@@ -2431,6 +2431,36 @@ fn create_robot_service(
 
 // ── Wave Execution ──────────────────────────────────────────────────────────
 
+/// Writer that accumulates wave worker output for later RPC delivery.
+///
+/// Output is collected via `Arc<Mutex<String>>` so it remains accessible
+/// after `CliExecutor::execute` consumes the writer. A single
+/// `WaveWorkerTextDelta` event is sent after execution completes, avoiding
+/// channel overflow from per-line `try_send` calls.
+struct WaveWorkerWriter {
+    output: Arc<std::sync::Mutex<String>>,
+}
+
+impl WaveWorkerWriter {
+    fn new(output: Arc<std::sync::Mutex<String>>) -> Self {
+        Self { output }
+    }
+}
+
+impl std::io::Write for WaveWorkerWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        if let Ok(mut out) = self.output.lock() {
+            out.push_str(&text);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Execute a detected wave by spawning parallel backend instances.
 ///
 /// Creates per-worker event files, spawns workers with concurrency-limited
@@ -2542,15 +2572,39 @@ async fn execute_wave(
         let worker_timeout = Some(wave_timeout);
         let worker_events_path = worker_events_file.clone();
         let tx = progress_tx.clone();
+        let worker_rpc_tx = rpc_event_tx.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = permit; // Hold permit for concurrency limiting
             let start = std::time::Instant::now();
 
             let executor = CliExecutor::new(worker_backend);
-            let result = executor
-                .execute(&prompt, std::io::sink(), worker_timeout, false)
-                .await;
+
+            // Accumulate output via shared buffer; send as single RPC event after completion
+            let output_buf = Arc::new(std::sync::Mutex::new(String::new()));
+            let result = if worker_rpc_tx.is_some() {
+                let writer = WaveWorkerWriter::new(Arc::clone(&output_buf));
+                executor
+                    .execute(&prompt, writer, worker_timeout, false)
+                    .await
+            } else {
+                executor
+                    .execute(&prompt, std::io::sink(), worker_timeout, false)
+                    .await
+            };
+
+            // Send accumulated worker output as a single event (avoids channel overflow)
+            if let Some(ref rpc_tx) = worker_rpc_tx {
+                let output = std::mem::take(&mut *output_buf.lock().unwrap());
+                if !output.is_empty() {
+                    let _ = rpc_tx
+                        .send(RpcEvent::WaveWorkerTextDelta {
+                            worker_index: index,
+                            delta: output,
+                        })
+                        .await;
+                }
+            }
 
             let duration = start.elapsed();
 
