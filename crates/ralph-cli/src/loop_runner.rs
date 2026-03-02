@@ -2437,30 +2437,6 @@ fn create_robot_service(
 /// after `CliExecutor::execute` consumes the writer. A single
 /// `WaveWorkerTextDelta` event is sent after execution completes, avoiding
 /// channel overflow from per-line `try_send` calls.
-struct WaveWorkerWriter {
-    output: Arc<std::sync::Mutex<String>>,
-}
-
-impl WaveWorkerWriter {
-    fn new(output: Arc<std::sync::Mutex<String>>) -> Self {
-        Self { output }
-    }
-}
-
-impl std::io::Write for WaveWorkerWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let text = String::from_utf8_lossy(buf);
-        if let Ok(mut out) = self.output.lock() {
-            out.push_str(&text);
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Execute a detected wave by spawning parallel backend instances.
 ///
 /// Creates per-worker event files, spawns workers with concurrency-limited
@@ -2569,7 +2545,6 @@ async fn execute_wave(
             worker_backend.args.extend(args.iter().cloned());
         }
 
-        let worker_timeout = Some(wave_timeout);
         let worker_events_path = worker_events_file.clone();
         let tx = progress_tx.clone();
         let worker_rpc_tx = rpc_event_tx.clone();
@@ -2578,57 +2553,139 @@ async fn execute_wave(
             let _permit = permit; // Hold permit for concurrency limiting
             let start = std::time::Instant::now();
 
-            let executor = CliExecutor::new(worker_backend);
+            // Build and spawn process directly for real-time stdout streaming.
+            // Unlike CliExecutor::execute (which buffers all stdout before writing),
+            // we read stdout line-by-line and send WaveWorkerTextDelta events immediately.
+            let (cmd, args, stdin_input, _temp_file) =
+                worker_backend.build_command(&prompt, false);
 
-            // Accumulate output via shared buffer; send as single RPC event after completion
-            let output_buf = Arc::new(std::sync::Mutex::new(String::new()));
-            let result = if worker_rpc_tx.is_some() {
-                let writer = WaveWorkerWriter::new(Arc::clone(&output_buf));
-                executor
-                    .execute(&prompt, writer, worker_timeout, false)
-                    .await
-            } else {
-                executor
-                    .execute(&prompt, std::io::sink(), worker_timeout, false)
-                    .await
+            let mut command = tokio::process::Command::new(&cmd);
+            command.args(&args);
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+
+            let cwd = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            command.current_dir(&cwd);
+            command.envs(worker_backend.env_vars.iter().map(|(k, v)| (k, v)));
+
+            if stdin_input.is_some() {
+                command.stdin(Stdio::piped());
+            }
+
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    let duration = start.elapsed();
+                    let _ = fs::remove_file(&worker_events_path);
+                    let _ = tx.send((index, false, duration));
+                    return (index, Err((e.to_string(), duration)));
+                }
             };
 
-            // Send accumulated worker output as a single event (avoids channel overflow)
-            if let Some(ref rpc_tx) = worker_rpc_tx {
-                let output = std::mem::take(&mut *output_buf.lock().unwrap());
-                if !output.is_empty() {
-                    let _ = rpc_tx
-                        .send(RpcEvent::WaveWorkerTextDelta {
-                            worker_index: index,
-                            delta: output,
-                        })
-                        .await;
+            // Write stdin if needed (large prompts use temp files via build_command)
+            if let Some(input) = stdin_input
+                && let Some(mut stdin) = child.stdin.take()
+            {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(input.as_bytes()).await;
+                drop(stdin);
+            }
+
+            let stdout_handle = child.stdout.take();
+            let stderr_handle = child.stderr.take();
+            let mut timed_out = false;
+
+            // Stream stdout line-by-line, sending RPC events in real-time
+            let stream_result = async {
+                let stdout_future = async {
+                    if let Some(stdout) = stdout_handle {
+                        use tokio::io::{AsyncBufReadExt, BufReader};
+                        let reader = BufReader::new(stdout);
+                        let mut lines = reader.lines();
+                        while let Some(line) = lines.next_line().await? {
+                            if let Some(ref rpc_tx) = worker_rpc_tx {
+                                let mut delta = line;
+                                delta.push('\n');
+                                let _ = rpc_tx
+                                    .send(RpcEvent::WaveWorkerTextDelta {
+                                        worker_index: index,
+                                        delta,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Ok::<_, std::io::Error>(())
+                };
+
+                // Read stderr concurrently to prevent pipe buffer deadlock
+                let stderr_future = async {
+                    if let Some(stderr) = stderr_handle {
+                        use tokio::io::{AsyncBufReadExt, BufReader};
+                        let reader = BufReader::new(stderr);
+                        let mut lines = reader.lines();
+                        while let Some(_line) = lines.next_line().await? {
+                            // Discard stderr (matches non-verbose CliExecutor behavior)
+                        }
+                    }
+                    Ok::<_, std::io::Error>(())
+                };
+
+                tokio::try_join!(stdout_future, stderr_future)
+            };
+
+            match tokio::time::timeout(wave_timeout, stream_result).await {
+                Ok(result) => {
+                    if let Err(e) = result {
+                        warn!(error = %e, worker = index, "Wave worker I/O error");
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_secs = wave_timeout.as_secs(),
+                        worker = index,
+                        "Wave worker timeout, sending SIGTERM"
+                    );
+                    timed_out = true;
+                    #[cfg(unix)]
+                    if let Some(pid) = child.id() {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let pid = nix::unistd::Pid::from_raw(pid as i32);
+                        let _ =
+                            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = child.start_kill();
+                    }
                 }
             }
 
+            let status = child.wait().await;
+            let success =
+                status.map(|s| s.success() && !timed_out).unwrap_or(false);
             let duration = start.elapsed();
 
-            match result {
-                Ok(exec_result) => {
-                    // Read result events from per-worker file
-                    let events = read_worker_events(&worker_events_path);
-                    // Clean up worker file
-                    let _ = fs::remove_file(&worker_events_path);
+            // Read result events from per-worker file
+            let events = read_worker_events(&worker_events_path);
+            let _ = fs::remove_file(&worker_events_path);
 
-                    if exec_result.timed_out && events.is_empty() {
-                        // Worker timed out without emitting events — record as failure
-                        let _ = tx.send((index, false, duration));
-                        (index, Err((format!("Worker timed out after {}s without emitting events", wave_timeout.as_secs()), duration)))
-                    } else {
-                        let _ = tx.send((index, true, duration));
-                        (index, Ok((events, duration, exec_result.success)))
-                    }
-                }
-                Err(e) => {
-                    let _ = fs::remove_file(&worker_events_path);
-                    let _ = tx.send((index, false, duration));
-                    (index, Err((e.to_string(), duration)))
-                }
+            if timed_out && events.is_empty() {
+                let _ = tx.send((index, false, duration));
+                (
+                    index,
+                    Err((
+                        format!(
+                            "Worker timed out after {}s without emitting events",
+                            wave_timeout.as_secs()
+                        ),
+                        duration,
+                    )),
+                )
+            } else {
+                let _ = tx.send((index, true, duration));
+                (index, Ok((events, duration, success)))
             }
         });
 
