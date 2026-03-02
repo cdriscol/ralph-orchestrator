@@ -57,14 +57,20 @@ pub fn render(state: &TuiState, width: u16) -> Paragraph<'static> {
         spans.push(Span::raw(iter_display));
     }
 
-    // Priority 4: Elapsed time (iteration) - hidden at WIDTH_COMPRESS and below
-    if let Some(elapsed) = state.get_iteration_elapsed()
-        && width > WIDTH_COMPRESS
-    {
-        let total_secs = elapsed.as_secs();
-        let mins = total_secs / 60;
-        let secs = total_secs % 60;
-        spans.push(Span::raw(format!(" {mins:02}:{secs:02}")));
+    // Priority 4: Elapsed time (iteration or wave) - hidden at WIDTH_COMPRESS and below
+    if width > WIDTH_COMPRESS {
+        let elapsed = if let Some(ref wave) = state.wave_active {
+            // Live wave timer replaces the iteration timer
+            Some(wave.started_at.elapsed())
+        } else {
+            state.get_iteration_elapsed()
+        };
+        if let Some(elapsed) = elapsed {
+            let total_secs = elapsed.as_secs();
+            let mins = total_secs / 60;
+            let secs = total_secs % 60;
+            spans.push(Span::raw(format!(" {mins:02}:{secs:02}")));
+        }
     }
 
     // Priority 3: Hat display - compressed at WIDTH_COMPRESS and below
@@ -89,7 +95,16 @@ pub fn render(state: &TuiState, width: u16) -> Paragraph<'static> {
     };
     if width > WIDTH_COMPRESS {
         // Full hat display: "🔨 Builder"
-        spans.push(Span::raw(hat_with_backend));
+        // When a wave is active, show the wave hat name instead and append [wave N/M]
+        if let Some(ref wave) = state.wave_active {
+            spans.push(Span::raw(format!("{} ", wave.hat_name)));
+            spans.push(Span::styled(
+                format!("[wave {}/{}]", wave.completed, wave.total),
+                Style::default().fg(Color::Magenta),
+            ));
+        } else {
+            spans.push(Span::raw(hat_with_backend));
+        }
     } else {
         // Compressed: emoji only (first character cluster)
         let emoji = hat_display.chars().next().unwrap_or('?');

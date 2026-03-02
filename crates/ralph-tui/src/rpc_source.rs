@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 
 use ralph_proto::json_rpc::RpcEvent;
 
-use crate::state::{TaskCounts, TuiState};
+use crate::state::{TaskCounts, TuiState, WaveInfo};
 use crate::state_mutations::{
     append_error_line, apply_loop_completed, apply_task_active, apply_task_close,
 };
@@ -406,6 +406,93 @@ fn apply_rpc_event(event: &RpcEvent, state: &Arc<Mutex<TuiState>>, acc: &mut Tex
         RpcEvent::OrchestrationEvent { topic, .. } => {
             // Generic orchestration events - just update liveness
             s.last_event = Some(topic.clone());
+            s.last_event_at = Some(Instant::now());
+        }
+
+        RpcEvent::WaveStarted {
+            hat_name,
+            worker_count,
+            timeout_secs,
+        } => {
+            s.wave_active = Some(WaveInfo {
+                hat_name: hat_name.clone(),
+                total: *worker_count,
+                completed: 0,
+                started_at: Instant::now(),
+            });
+            let line = Line::from(vec![
+                Span::styled("── WAVE: ", Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    format!("{} | {} workers | timeout {}s", hat_name, worker_count, timeout_secs),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::styled(
+                    " ──────────────────────",
+                    Style::default().fg(Color::Magenta),
+                ),
+            ]);
+            if let Some(handle) = s.latest_iteration_lines_handle() {
+                acc.push_non_text(line, &handle);
+            }
+            s.last_event = Some("wave_started".to_string());
+            s.last_event_at = Some(Instant::now());
+        }
+
+        RpcEvent::WaveWorkerDone {
+            index,
+            total,
+            duration_ms,
+            success,
+            payload_preview,
+        } => {
+            if let Some(ref mut wave) = s.wave_active {
+                wave.completed += 1;
+            }
+            let secs = *duration_ms / 1000;
+            let (icon, color) = if *success {
+                ("\u{2713}", Color::Green)
+            } else {
+                ("\u{2717}", Color::Red)
+            };
+            let status_word = if *success { "done" } else { "failed" };
+            let preview = truncate(payload_preview, 60);
+            let line = Line::from(vec![
+                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                Span::raw(format!(
+                    "Worker {}/{} {} ({}s) — {}",
+                    index + 1,
+                    total,
+                    status_word,
+                    secs,
+                    preview
+                )),
+            ]);
+            if let Some(handle) = s.latest_iteration_lines_handle() {
+                acc.push_non_text(line, &handle);
+            }
+            s.last_event = Some("wave_worker_done".to_string());
+            s.last_event_at = Some(Instant::now());
+        }
+
+        RpcEvent::WaveCompleted {
+            succeeded,
+            failed,
+            duration_ms,
+        } => {
+            s.wave_active = None;
+            let secs = *duration_ms / 1000;
+            let color = if *failed > 0 { Color::Yellow } else { Color::Green };
+            let line = Line::from(Span::styled(
+                format!(
+                    "── Wave complete: {} succeeded, {} failed ({}s) ──────────────────────",
+                    succeeded, failed, secs
+                ),
+                Style::default().fg(color),
+            ));
+            if let Some(handle) = s.latest_iteration_lines_handle() {
+                acc.push_non_text(line, &handle);
+            }
+            s.last_event = Some("wave_completed".to_string());
             s.last_event_at = Some(Instant::now());
         }
     }

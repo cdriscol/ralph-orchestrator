@@ -1415,9 +1415,9 @@ pub async fn run_loop_impl(
                     "Wave detected, executing parallel workers"
                 );
 
-                let show_wave_progress = tui_state.is_none() && !enable_rpc;
+                let show_wave_cli = tui_state.is_none() && !enable_rpc;
 
-                // Compute timeout for header display
+                // Compute timeout for header display and RPC
                 let wave_timeout_secs = detected
                     .hat_config
                     .timeout
@@ -1431,13 +1431,20 @@ pub async fn run_loop_impl(
                     })
                     .unwrap_or(300);
 
-                if show_wave_progress {
+                if show_wave_cli {
                     print_wave_header(
                         &detected.hat_config.name,
                         detected.total as usize,
                         wave_timeout_secs,
                         use_colors,
                     );
+                }
+                if let Some(ref tx) = rpc_event_tx {
+                    let _ = tx.try_send(RpcEvent::WaveStarted {
+                        hat_name: detected.hat_config.name.clone(),
+                        worker_count: detected.total,
+                        timeout_secs: wave_timeout_secs,
+                    });
                 }
 
                 let main_events_file = resolve_current_events_path(&ctx);
@@ -1446,20 +1453,28 @@ pub async fn run_loop_impl(
                     &backend,
                     &config,
                     &main_events_file,
-                    show_wave_progress,
+                    show_wave_cli,
                     use_colors,
+                    rpc_event_tx.clone(),
                 )
                 .await;
 
                 match wave_result {
                     Ok(completed) => {
-                        if show_wave_progress {
+                        if show_wave_cli {
                             print_wave_summary(
                                 completed.results.len(),
                                 completed.failures.len(),
                                 completed.duration,
                                 use_colors,
                             );
+                        }
+                        if let Some(ref tx) = rpc_event_tx {
+                            let _ = tx.try_send(RpcEvent::WaveCompleted {
+                                succeeded: completed.results.len(),
+                                failed: completed.failures.len(),
+                                duration_ms: completed.duration.as_millis() as u64,
+                            });
                         }
 
                         info!(
@@ -2427,6 +2442,7 @@ async fn execute_wave(
     main_events_file: &Path,
     show_progress: bool,
     use_colors: bool,
+    rpc_event_tx: Option<tokio::sync::mpsc::Sender<RpcEvent>>,
 ) -> Result<ralph_core::CompletedWave> {
     use ralph_core::{WaveTracker, WaveWorkerContext, build_wave_worker_prompt};
 
@@ -2568,33 +2584,35 @@ async fn execute_wave(
     // Drop our sender so the receiver terminates when all workers finish
     drop(progress_tx);
 
-    // Spawn a task to print real-time progress
+    // Spawn a task to report real-time progress (CLI and/or RPC)
     let total = wave.total;
     let previews = payload_previews.clone();
-    let progress_handle = if show_progress {
-        Some(tokio::spawn(async move {
-            while let Some((index, success, duration)) = progress_rx.recv().await {
-                let preview = previews
-                    .get(index as usize)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
+    let progress_handle = tokio::spawn(async move {
+        while let Some((index, success, duration)) = progress_rx.recv().await {
+            let preview = previews
+                .get(index as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if show_progress {
                 print_wave_worker_done(index, total, duration, success, preview, use_colors);
             }
-        }))
-    } else {
-        // Drain the channel without printing
-        Some(tokio::spawn(async move {
-            while progress_rx.recv().await.is_some() {}
-        }))
-    };
+            if let Some(ref tx) = rpc_event_tx {
+                let _ = tx.try_send(RpcEvent::WaveWorkerDone {
+                    index,
+                    total,
+                    duration_ms: duration.as_millis() as u64,
+                    success,
+                    payload_preview: preview.to_string(),
+                });
+            }
+        }
+    });
 
     // Collect results
     let results = futures::future::join_all(handles).await;
 
-    // Wait for progress printer to finish
-    if let Some(handle) = progress_handle {
-        let _ = handle.await;
-    }
+    // Wait for progress reporter to finish
+    let _ = progress_handle.await;
 
     for result in results {
         match result {

@@ -113,6 +113,18 @@ pub enum GuidanceResult {
     Failed,
 }
 
+// ============================================================================
+// WaveInfo - Active wave tracking for TUI header display
+// ============================================================================
+
+/// Tracks active wave execution for header display.
+pub struct WaveInfo {
+    pub hat_name: String,
+    pub total: u32,
+    pub completed: u32,
+    pub started_at: Instant,
+}
+
 /// Observable state derived from loop events.
 pub struct TuiState {
     /// Which hat will process next event (ID + display name).
@@ -186,6 +198,12 @@ pub struct TuiState {
     pub active_task: Option<TaskSummary>,
 
     // ========================================================================
+    // Wave State
+    // ========================================================================
+    /// Active wave info for header display.
+    pub wave_active: Option<WaveInfo>,
+
+    // ========================================================================
     // Guidance State
     // ========================================================================
     /// Active guidance input mode (None when not entering guidance).
@@ -253,6 +271,8 @@ impl TuiState {
             // Task tracking state
             task_counts: TaskCounts::default(),
             active_task: None,
+            // Wave state
+            wave_active: None,
             // Guidance state
             guidance_mode: None,
             guidance_input: String::new(),
@@ -300,6 +320,8 @@ impl TuiState {
             // Task tracking state
             task_counts: TaskCounts::default(),
             active_task: None,
+            // Wave state
+            wave_active: None,
             // Guidance state
             guidance_mode: None,
             guidance_input: String::new(),
