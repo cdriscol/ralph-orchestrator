@@ -1448,10 +1448,36 @@ pub async fn run_loop_impl(
                 }
                 if let Some(ref state) = tui_state {
                     if let Ok(mut s) = state.lock() {
+                        info!(
+                            hat = %detected.hat_config.name,
+                            workers = detected.total,
+                            "Setting wave_active on TUI state"
+                        );
                         s.wave_active = Some(ralph_tui::state::WaveInfo::new(
                             detected.hat_config.name.clone(),
                             detected.total,
                         ));
+                        // Seed each worker buffer with an initial placeholder line so the
+                        // wave drill-down view ('w') shows immediate feedback while workers
+                        // launch and before their first stdout arrives.
+                        if let Some(ref wave) = s.wave_active {
+                            for (i, buffer) in wave.worker_buffers.iter().enumerate() {
+                                let handle = buffer.lines_handle();
+                                if let Ok(mut buf_lines) = handle.lock() {
+                                    buf_lines.push(ratatui::text::Line::from(
+                                        ratatui::text::Span::styled(
+                                            format!(
+                                                "Worker {}/{}: launching...",
+                                                i + 1,
+                                                detected.total
+                                            ),
+                                            ratatui::style::Style::default()
+                                                .fg(ratatui::style::Color::DarkGray),
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
                         let line = ratatui::text::Line::from(vec![
                             ratatui::text::Span::styled(
                                 "── WAVE: ",
@@ -2746,10 +2772,18 @@ async fn execute_wave(
                                             {
                                                 let handle = buffer.lines_handle();
                                                 if let Ok(mut buf_lines) = handle.lock() {
-                                                    buf_lines
-                                                        .extend(ralph_tui::text_to_lines(delta));
+                                                    let new_lines = ralph_tui::text_to_lines(delta);
+                                                    debug!(
+                                                        worker = index,
+                                                        new_lines = new_lines.len(),
+                                                        total_lines = buf_lines.len() + new_lines.len(),
+                                                        "Wave worker TUI delta push"
+                                                    );
+                                                    buf_lines.extend(new_lines);
                                                 }
                                             }
+                                        } else {
+                                            debug!(worker = index, "Wave worker: wave_active is None");
                                         }
                                     }
                                 }
