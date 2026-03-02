@@ -2431,12 +2431,6 @@ fn create_robot_service(
 
 // ── Wave Execution ──────────────────────────────────────────────────────────
 
-/// Writer that accumulates wave worker output for later RPC delivery.
-///
-/// Output is collected via `Arc<Mutex<String>>` so it remains accessible
-/// after `CliExecutor::execute` consumes the writer. A single
-/// `WaveWorkerTextDelta` event is sent after execution completes, avoiding
-/// channel overflow from per-line `try_send` calls.
 /// Execute a detected wave by spawning parallel backend instances.
 ///
 /// Creates per-worker event files, spawns workers with concurrency-limited
@@ -2596,23 +2590,91 @@ async fn execute_wave(
             let stderr_handle = child.stderr.take();
             let mut timed_out = false;
 
-            // Stream stdout line-by-line, sending RPC events in real-time
+            // Determine output format to correctly parse stdout.
+            // Claude uses StreamJson (NDJSON), other backends use plain text.
+            let is_stream_json = worker_backend.output_format
+                == BackendOutputFormat::StreamJson;
+
+            // Stream stdout line-by-line, sending RPC events in real-time.
+            // For StreamJson (Claude), parse NDJSON and extract readable content.
+            // For Text backends, forward raw lines directly.
             let stream_result = async {
                 let stdout_future = async {
                     if let Some(stdout) = stdout_handle {
+                        use ralph_adapters::{
+                            ClaudeStreamEvent, ClaudeStreamParser, ContentBlock,
+                        };
                         use tokio::io::{AsyncBufReadExt, BufReader};
                         let reader = BufReader::new(stdout);
                         let mut lines = reader.lines();
                         while let Some(line) = lines.next_line().await? {
                             if let Some(ref rpc_tx) = worker_rpc_tx {
-                                let mut delta = line;
-                                delta.push('\n');
-                                let _ = rpc_tx
-                                    .send(RpcEvent::WaveWorkerTextDelta {
-                                        worker_index: index,
-                                        delta,
-                                    })
-                                    .await;
+                                let delta = if is_stream_json {
+                                    // Parse NDJSON and extract readable content
+                                    match ClaudeStreamParser::parse_line(&line) {
+                                        Some(ClaudeStreamEvent::Assistant {
+                                            message, ..
+                                        }) => {
+                                            let mut text = String::new();
+                                            for block in message.content {
+                                                match block {
+                                                    ContentBlock::Text { text: t } => {
+                                                        text.push_str(&t);
+                                                        text.push('\n');
+                                                    }
+                                                    ContentBlock::ToolUse {
+                                                        name,
+                                                        input,
+                                                        ..
+                                                    } => {
+                                                        text.push_str(&format!(
+                                                            "⚙ {name}({input})\n"
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            if text.is_empty() {
+                                                None
+                                            } else {
+                                                Some(text)
+                                            }
+                                        }
+                                        Some(ClaudeStreamEvent::User { message }) => {
+                                            let mut text = String::new();
+                                            for block in message.content {
+                                                let ralph_adapters::UserContentBlock::ToolResult { content, .. } = block;
+                                                if !content.is_empty() {
+                                                    text.push_str(&format!(
+                                                        "→ {}\n",
+                                                        if content.len() > 200 {
+                                                            format!("{}…", &content[..200])
+                                                        } else {
+                                                            content
+                                                        }
+                                                    ));
+                                                }
+                                            }
+                                            if text.is_empty() {
+                                                None
+                                            } else {
+                                                Some(text)
+                                            }
+                                        }
+                                        _ => None, // Skip System/Result events
+                                    }
+                                } else {
+                                    // Text format: forward raw lines
+                                    Some(format!("{line}\n"))
+                                };
+
+                                if let Some(delta) = delta {
+                                    let _ = rpc_tx
+                                        .send(RpcEvent::WaveWorkerTextDelta {
+                                            worker_index: index,
+                                            delta,
+                                        })
+                                        .await;
+                                }
                             }
                         }
                     }
