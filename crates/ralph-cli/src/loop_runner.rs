@@ -1446,6 +1446,39 @@ pub async fn run_loop_impl(
                         timeout_secs: wave_timeout_secs,
                     });
                 }
+                if let Some(ref state) = tui_state {
+                    if let Ok(mut s) = state.lock() {
+                        s.wave_active = Some(ralph_tui::state::WaveInfo::new(
+                            detected.hat_config.name.clone(),
+                            detected.total,
+                        ));
+                        let line = ratatui::text::Line::from(vec![
+                            ratatui::text::Span::styled(
+                                "── WAVE: ",
+                                ratatui::style::Style::default()
+                                    .fg(ratatui::style::Color::Magenta),
+                            ),
+                            ratatui::text::Span::styled(
+                                format!(
+                                    "{} | {} workers | timeout {}s",
+                                    detected.hat_config.name, detected.total, wave_timeout_secs
+                                ),
+                                ratatui::style::Style::default()
+                                    .fg(ratatui::style::Color::Magenta),
+                            ),
+                            ratatui::text::Span::styled(
+                                " ──────────────────────",
+                                ratatui::style::Style::default()
+                                    .fg(ratatui::style::Color::Magenta),
+                            ),
+                        ]);
+                        if let Some(handle) = s.latest_iteration_lines_handle() {
+                            if let Ok(mut lines) = handle.lock() {
+                                lines.push(line);
+                            }
+                        }
+                    }
+                }
 
                 let main_events_file = resolve_current_events_path(&ctx);
                 let wave_result = execute_wave(
@@ -1456,6 +1489,7 @@ pub async fn run_loop_impl(
                     show_wave_cli,
                     use_colors,
                     rpc_event_tx.clone(),
+                    tui_state.clone(),
                 )
                 .await;
 
@@ -1475,6 +1509,33 @@ pub async fn run_loop_impl(
                                 failed: completed.failures.len(),
                                 duration_ms: completed.duration.as_millis() as u64,
                             });
+                        }
+                        if let Some(ref state) = tui_state {
+                            if let Ok(mut s) = state.lock() {
+                                s.wave_completed_buffers = s.wave_active.take();
+                                let secs = completed.duration.as_secs();
+                                let color = if completed.failures.is_empty() {
+                                    ratatui::style::Color::Green
+                                } else {
+                                    ratatui::style::Color::Yellow
+                                };
+                                let line = ratatui::text::Line::from(
+                                    ratatui::text::Span::styled(
+                                        format!(
+                                            "── Wave complete: {} succeeded, {} failed ({}s) ──────────────────────",
+                                            completed.results.len(),
+                                            completed.failures.len(),
+                                            secs,
+                                        ),
+                                        ratatui::style::Style::default().fg(color),
+                                    ),
+                                );
+                                if let Some(handle) = s.latest_iteration_lines_handle() {
+                                    if let Ok(mut lines) = handle.lock() {
+                                        lines.push(line);
+                                    }
+                                }
+                            }
                         }
 
                         info!(
@@ -2443,6 +2504,7 @@ async fn execute_wave(
     show_progress: bool,
     use_colors: bool,
     rpc_event_tx: Option<tokio::sync::mpsc::Sender<RpcEvent>>,
+    tui_state: Option<Arc<std::sync::Mutex<ralph_tui::TuiState>>>,
 ) -> Result<ralph_core::CompletedWave> {
     use ralph_core::{WaveTracker, WaveWorkerContext, build_wave_worker_prompt};
 
@@ -2542,6 +2604,7 @@ async fn execute_wave(
         let worker_events_path = worker_events_file.clone();
         let tx = progress_tx.clone();
         let worker_rpc_tx = rpc_event_tx.clone();
+        let worker_tui_state = tui_state.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = permit; // Hold permit for concurrency limiting
@@ -2595,7 +2658,7 @@ async fn execute_wave(
             let is_stream_json = worker_backend.output_format
                 == BackendOutputFormat::StreamJson;
 
-            // Stream stdout line-by-line, sending RPC events in real-time.
+            // Stream stdout line-by-line, forwarding to RPC and/or TUI in real-time.
             // For StreamJson (Claude), parse NDJSON and extract readable content.
             // For Text backends, forward raw lines directly.
             let stream_result = async {
@@ -2606,74 +2669,89 @@ async fn execute_wave(
                         };
                         use tokio::io::{AsyncBufReadExt, BufReader};
                         let reader = BufReader::new(stdout);
-                        let mut lines = reader.lines();
-                        while let Some(line) = lines.next_line().await? {
-                            if let Some(ref rpc_tx) = worker_rpc_tx {
-                                let delta = if is_stream_json {
-                                    // Parse NDJSON and extract readable content
-                                    match ClaudeStreamParser::parse_line(&line) {
-                                        Some(ClaudeStreamEvent::Assistant {
-                                            message, ..
-                                        }) => {
-                                            let mut text = String::new();
-                                            for block in message.content {
-                                                match block {
-                                                    ContentBlock::Text { text: t } => {
-                                                        text.push_str(&t);
-                                                        text.push('\n');
-                                                    }
-                                                    ContentBlock::ToolUse {
-                                                        name,
-                                                        input,
-                                                        ..
-                                                    } => {
-                                                        text.push_str(&format!(
-                                                            "⚙ {name}({input})\n"
-                                                        ));
-                                                    }
+                        let mut stdout_lines = reader.lines();
+                        while let Some(line) = stdout_lines.next_line().await? {
+                            let delta = if is_stream_json {
+                                // Parse NDJSON and extract readable content
+                                match ClaudeStreamParser::parse_line(&line) {
+                                    Some(ClaudeStreamEvent::Assistant {
+                                        message, ..
+                                    }) => {
+                                        let mut text = String::new();
+                                        for block in message.content {
+                                            match block {
+                                                ContentBlock::Text { text: t } => {
+                                                    text.push_str(&t);
+                                                    text.push('\n');
                                                 }
-                                            }
-                                            if text.is_empty() {
-                                                None
-                                            } else {
-                                                Some(text)
-                                            }
-                                        }
-                                        Some(ClaudeStreamEvent::User { message }) => {
-                                            let mut text = String::new();
-                                            for block in message.content {
-                                                let ralph_adapters::UserContentBlock::ToolResult { content, .. } = block;
-                                                if !content.is_empty() {
+                                                ContentBlock::ToolUse {
+                                                    name,
+                                                    input,
+                                                    ..
+                                                } => {
                                                     text.push_str(&format!(
-                                                        "→ {}\n",
-                                                        if content.len() > 200 {
-                                                            format!("{}…", &content[..200])
-                                                        } else {
-                                                            content
-                                                        }
+                                                        "⚙ {name}({input})\n"
                                                     ));
                                                 }
                                             }
-                                            if text.is_empty() {
-                                                None
-                                            } else {
-                                                Some(text)
+                                        }
+                                        if text.is_empty() {
+                                            None
+                                        } else {
+                                            Some(text)
+                                        }
+                                    }
+                                    Some(ClaudeStreamEvent::User { message }) => {
+                                        let mut text = String::new();
+                                        for block in message.content {
+                                            let ralph_adapters::UserContentBlock::ToolResult { content, .. } = block;
+                                            if !content.is_empty() {
+                                                text.push_str(&format!(
+                                                    "→ {}\n",
+                                                    if content.len() > 200 {
+                                                        format!("{}…", &content[..200])
+                                                    } else {
+                                                        content
+                                                    }
+                                                ));
                                             }
                                         }
-                                        _ => None, // Skip System/Result events
+                                        if text.is_empty() {
+                                            None
+                                        } else {
+                                            Some(text)
+                                        }
                                     }
-                                } else {
-                                    // Text format: forward raw lines
-                                    Some(format!("{line}\n"))
-                                };
+                                    _ => None, // Skip System/Result events
+                                }
+                            } else {
+                                // Text format: forward raw lines
+                                Some(format!("{line}\n"))
+                            };
 
-                                if let Some(delta) = delta {
+                            if let Some(ref delta) = delta {
+                                if let Some(ref rpc_tx) = worker_rpc_tx {
                                     let _ = rpc_tx
                                         .send(RpcEvent::WaveWorkerTextDelta {
                                             worker_index: index,
-                                            delta,
+                                            delta: delta.clone(),
                                         })
                                         .await;
+                                }
+                                if let Some(ref state) = worker_tui_state {
+                                    if let Ok(s) = state.lock() {
+                                        if let Some(ref wave) = s.wave_active {
+                                            if let Some(buffer) =
+                                                wave.worker_buffers.get(index as usize)
+                                            {
+                                                let handle = buffer.lines_handle();
+                                                if let Ok(mut buf_lines) = handle.lock() {
+                                                    buf_lines
+                                                        .extend(ralph_tui::text_to_lines(delta));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2757,7 +2835,7 @@ async fn execute_wave(
     // Drop our sender so the receiver terminates when all workers finish
     drop(progress_tx);
 
-    // Spawn a task to report real-time progress (CLI and/or RPC)
+    // Spawn a task to report real-time progress (CLI, RPC, and/or TUI)
     let total = wave.total;
     let previews = payload_previews.clone();
     let progress_handle = tokio::spawn(async move {
@@ -2777,6 +2855,44 @@ async fn execute_wave(
                     success,
                     payload_preview: preview.to_string(),
                 });
+            }
+            if let Some(ref state) = tui_state {
+                if let Ok(mut s) = state.lock() {
+                    if let Some(ref mut wave) = s.wave_active {
+                        wave.completed += 1;
+                    }
+                    let secs = duration.as_secs();
+                    let (icon, color) = if success {
+                        ("\u{2713}", ratatui::style::Color::Green)
+                    } else {
+                        ("\u{2717}", ratatui::style::Color::Red)
+                    };
+                    let status_word = if success { "done" } else { "failed" };
+                    let truncated_preview = if preview.len() > 60 {
+                        &preview[..60]
+                    } else {
+                        preview
+                    };
+                    let line = ratatui::text::Line::from(vec![
+                        ratatui::text::Span::styled(
+                            format!("  {} ", icon),
+                            ratatui::style::Style::default().fg(color),
+                        ),
+                        ratatui::text::Span::raw(format!(
+                            "Worker {}/{} {} ({}s) — {}",
+                            index + 1,
+                            total,
+                            status_word,
+                            secs,
+                            truncated_preview
+                        )),
+                    ]);
+                    if let Some(handle) = s.latest_iteration_lines_handle() {
+                        if let Ok(mut buf_lines) = handle.lock() {
+                            buf_lines.push(line);
+                        }
+                    }
+                }
             }
         }
     });
