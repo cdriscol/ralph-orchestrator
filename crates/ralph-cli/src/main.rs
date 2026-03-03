@@ -1437,8 +1437,17 @@ async fn run_command(
 
     // Try to acquire the loop lock for multi-loop concurrency support
     // This implements the lock detection flow from the multi-loop spec
+    //
+    // RPC mode (--rpc) is a subprocess spawned by the parent TUI. It runs in the
+    // same workspace as the parent and must NOT acquire or conflict with the lock.
+    // The parent already holds the lock; the child just needs to run in-place.
     let workspace_root = &config.core.workspace_root;
-    let (loop_context, _lock_guard) = match LoopLock::try_acquire(workspace_root, &prompt_summary) {
+    let (loop_context, _lock_guard) = if args.rpc {
+        debug!("RPC mode: skipping lock acquisition (parent holds lock)");
+        let context = LoopContext::primary(workspace_root.clone());
+        (context, None)
+    } else {
+        match LoopLock::try_acquire(workspace_root, &prompt_summary) {
         Ok(guard) => {
             // We're the primary loop - run in place
             debug!("Acquired loop lock, running as primary loop");
@@ -1542,6 +1551,7 @@ async fn run_command(
         Err(e) => {
             return Err(anyhow::Error::new(e).context("Failed to acquire loop lock"));
         }
+    }
     };
 
     // Update workspace_root in config if running in worktree

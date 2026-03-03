@@ -473,14 +473,33 @@ fn apply_rpc_event(event: &RpcEvent, state: &Arc<Mutex<TuiState>>, acc: &mut Tex
             worker_index,
             delta,
         } => {
+            tracing::debug!(
+                worker = worker_index,
+                delta_len = delta.len(),
+                wave_active = s.wave_active.is_some(),
+                "RPC: received WaveWorkerTextDelta"
+            );
             if let Some(ref wave) = s.wave_active
                 && let Some(buffer) = wave.worker_buffers.get(*worker_index as usize)
             {
+                let new_lines = text_to_lines(delta);
                 let handle = buffer.lines_handle();
                 if let Ok(mut lines) = handle.lock() {
+                    tracing::debug!(
+                        worker = worker_index,
+                        new_lines = new_lines.len(),
+                        total_lines = lines.len() + new_lines.len(),
+                        "RPC: appending lines to wave worker buffer"
+                    );
                     // Append rendered text lines from the delta
-                    lines.extend(text_to_lines(delta));
+                    lines.extend(new_lines);
                 }
+            } else {
+                tracing::warn!(
+                    worker = worker_index,
+                    wave_active = s.wave_active.is_some(),
+                    "RPC: WaveWorkerTextDelta dropped — no wave_active or buffer"
+                );
             }
             s.last_event = Some("wave_worker_text_delta".to_string());
             s.last_event_at = Some(Instant::now());

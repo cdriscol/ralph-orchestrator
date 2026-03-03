@@ -570,8 +570,10 @@ impl TuiState {
         self.rpc_text_buffer.clear();
         self.rpc_text_line_count = 0;
 
-        // Clear completed wave buffers and exit wave view on new iteration
-        self.wave_completed_buffers = None;
+        // Preserve wave_completed_buffers across iterations so users can review
+        // per-worker output in the drill-down view ('w' key) after the wave finishes.
+        // The buffers are only replaced when a new wave starts (WaveStarted event).
+        // Exit wave view on new iteration though — the user can re-enter with 'w'.
         self.wave_view_active = false;
 
         let hat_display = hat_display.or_else(|| {

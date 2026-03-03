@@ -2696,7 +2696,17 @@ async fn execute_wave(
                         use tokio::io::{AsyncBufReadExt, BufReader};
                         let reader = BufReader::new(stdout);
                         let mut stdout_lines = reader.lines();
+                        let mut line_count: u64 = 0;
                         while let Some(line) = stdout_lines.next_line().await? {
+                            line_count += 1;
+                            if line_count == 1 {
+                                info!(
+                                    worker = index,
+                                    line_len = line.len(),
+                                    is_stream_json,
+                                    "Wave worker: first stdout line received"
+                                );
+                            }
                             let delta = if is_stream_json {
                                 // Parse NDJSON and extract readable content
                                 match ClaudeStreamParser::parse_line(&line) {
@@ -2756,6 +2766,13 @@ async fn execute_wave(
                             };
 
                             if let Some(ref delta) = delta {
+                                debug!(
+                                    worker = index,
+                                    delta_len = delta.len(),
+                                    rpc_tx = worker_rpc_tx.is_some(),
+                                    tui_state = worker_tui_state.is_some(),
+                                    "Wave worker stdout: sending text delta"
+                                );
                                 if let Some(ref rpc_tx) = worker_rpc_tx {
                                     let _ = rpc_tx
                                         .send(RpcEvent::WaveWorkerTextDelta {
@@ -2799,8 +2816,11 @@ async fn execute_wave(
                         use tokio::io::{AsyncBufReadExt, BufReader};
                         let reader = BufReader::new(stderr);
                         let mut lines = reader.lines();
-                        while let Some(_line) = lines.next_line().await? {
-                            // Discard stderr (matches non-verbose CliExecutor behavior)
+                        while let Some(line) = lines.next_line().await? {
+                            // Log worker stderr for debugging (otherwise errors are invisible)
+                            if !line.trim().is_empty() {
+                                debug!(worker = index, stderr = %line, "Wave worker stderr");
+                            }
                         }
                     }
                     Ok::<_, std::io::Error>(())
