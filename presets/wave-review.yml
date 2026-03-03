@@ -55,6 +55,7 @@ hats:
       - Each payload must clearly state the reviewer's ROLE and FOCUS area
       - Tailor the specialties to the code being reviewed
       - You may substitute or add specialties (e.g., Security, Database, API Design) based on what's relevant
+      - IMPORTANT: You MUST use `ralph wave emit` to dispatch reviewers. Do NOT use the Agent tool or any other parallelism mechanism. The wave system handles parallel execution.
 
   reviewer:
     name: "🔍 Reviewer"

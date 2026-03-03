@@ -2919,7 +2919,7 @@ async fn execute_wave(
                     };
                     let status_word = if success { "done" } else { "failed" };
                     let truncated_preview = if preview.len() > 60 {
-                        &preview[..60]
+                        &preview[..preview.floor_char_boundary(60)]
                     } else {
                         preview
                     };

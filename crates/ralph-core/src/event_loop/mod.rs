@@ -2345,11 +2345,21 @@ impl EventLoop {
             self.state.consecutive_malformed_events = 0;
         }
 
-        // Partition: wave events vs regular events
+        // Partition: wave dispatch events vs regular events.
+        // Only events that target a concurrent hat (concurrency > 1) are wave dispatches.
+        // Wave *results* (e.g. review.done) have wave_id set but should be treated as
+        // regular events so they reach the bus and trigger downstream hats (e.g. aggregator).
         let (wave_events, regular_events): (Vec<_>, Vec<_>) = result
             .events
             .into_iter()
-            .partition(|e| e.wave_id.is_some());
+            .partition(|e| {
+                e.wave_id.is_some()
+                    && self
+                        .registry
+                        .get_for_topic(e.topic.as_str())
+                        .and_then(|hat| self.config.hats.get(hat.id.as_str()))
+                        .is_some_and(|hat_config| hat_config.concurrency > 1)
+            });
 
         if !wave_events.is_empty() {
             debug!(
