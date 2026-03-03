@@ -51,6 +51,9 @@ ratatui.workspace = true
 # For progress spinners
 indicatif.workspace = true
 
+# For PTY-based wave worker spawning (forces unbuffered stdout)
+portable-pty.workspace = true
+
 # For opening URLs in the default browser
 open.workspace = true
 

@@ -2636,197 +2636,197 @@ async fn execute_wave(
             let _permit = permit; // Hold permit for concurrency limiting
             let start = std::time::Instant::now();
 
-            // Build and spawn process directly for real-time stdout streaming.
-            // Unlike CliExecutor::execute (which buffers all stdout before writing),
-            // we read stdout line-by-line and send WaveWorkerTextDelta events immediately.
+            // Build and spawn process in a PTY for real-time stdout streaming.
+            // Node.js (Claude Code) buffers stdout when it's a pipe, so NDJSON
+            // events only arrive when the process exits. Using a PTY forces the
+            // child to see a terminal and flush after each line.
             let (cmd, args, stdin_input, _temp_file) =
                 worker_backend.build_command(&prompt, false);
 
-            let mut command = tokio::process::Command::new(&cmd);
-            command.args(&args);
-            command.stdout(Stdio::piped());
-            command.stderr(Stdio::piped());
-
             let cwd = std::env::current_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
-            command.current_dir(&cwd);
-            command.envs(worker_backend.env_vars.iter().map(|(k, v)| (k, v)));
-
-            if stdin_input.is_some() {
-                command.stdin(Stdio::piped());
-            }
-
-            let mut child = match command.spawn() {
-                Ok(child) => child,
-                Err(e) => {
-                    let duration = start.elapsed();
-                    let _ = fs::remove_file(&worker_events_path);
-                    let _ = tx.send((index, false, duration));
-                    return (index, Err((e.to_string(), duration)));
-                }
-            };
-
-            // Write stdin if needed (large prompts use temp files via build_command)
-            if let Some(input) = stdin_input
-                && let Some(mut stdin) = child.stdin.take()
-            {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(input.as_bytes()).await;
-                drop(stdin);
-            }
-
-            let stdout_handle = child.stdout.take();
-            let stderr_handle = child.stderr.take();
-            let mut timed_out = false;
 
             // Determine output format to correctly parse stdout.
             // Claude uses StreamJson (NDJSON), other backends use plain text.
             let is_stream_json = worker_backend.output_format
                 == BackendOutputFormat::StreamJson;
 
-            // Stream stdout line-by-line, forwarding to RPC and/or TUI in real-time.
+            // Spawn worker in a PTY so stdout is unbuffered
+            let pty_system = portable_pty::native_pty_system();
+            let pty_pair = match pty_system.openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let duration = start.elapsed();
+                    let _ = fs::remove_file(&worker_events_path);
+                    let _ = tx.send((index, false, duration));
+                    return (index, Err((format!("PTY open failed: {e}"), duration)));
+                }
+            };
+
+            let mut cmd_builder = portable_pty::CommandBuilder::new(&cmd);
+            cmd_builder.args(&args);
+            cmd_builder.cwd(&cwd);
+            for (key, value) in &worker_backend.env_vars {
+                cmd_builder.env(key, value);
+            }
+
+            let mut child = match pty_pair.slave.spawn_command(cmd_builder) {
+                Ok(child) => child,
+                Err(e) => {
+                    let duration = start.elapsed();
+                    let _ = fs::remove_file(&worker_events_path);
+                    let _ = tx.send((index, false, duration));
+                    return (index, Err((format!("PTY spawn failed: {e}"), duration)));
+                }
+            };
+            // Drop slave so we get EOF when child exits
+            drop(pty_pair.slave);
+
+            // Write stdin if needed (large prompts use temp files via build_command)
+            if let Some(input) = stdin_input {
+                if let Ok(mut writer) = pty_pair.master.take_writer() {
+                    let _ = writer.write_all(input.as_bytes());
+                    // Don't drop writer — PTY input stays open
+                }
+            }
+
+            // Read PTY output in a blocking thread (portable-pty readers are sync)
+            let pty_reader = match pty_pair.master.try_clone_reader() {
+                Ok(reader) => reader,
+                Err(e) => {
+                    let duration = start.elapsed();
+                    let _ = fs::remove_file(&worker_events_path);
+                    let _ = tx.send((index, false, duration));
+                    return (index, Err((format!("PTY reader failed: {e}"), duration)));
+                }
+            };
+
+            // Channel for PTY lines → async context
+            let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(256);
+            let reader_handle = std::thread::spawn(move || {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(pty_reader);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            if line_tx.blocking_send(line).is_err() {
+                                break; // Receiver dropped
+                            }
+                        }
+                        Err(_) => break, // EOF or read error
+                    }
+                }
+            });
+
+            let mut timed_out = false;
+
+            // Stream lines from PTY, forwarding to RPC and/or TUI in real-time.
             // For StreamJson (Claude), parse NDJSON and extract readable content.
             // For Text backends, forward raw lines directly.
             let stream_result = async {
-                let stdout_future = async {
-                    if let Some(stdout) = stdout_handle {
+                let mut line_count: u64 = 0;
+                while let Some(line) = line_rx.recv().await {
+                    line_count += 1;
+                    if line_count == 1 {
+                        info!(
+                            worker = index,
+                            line_len = line.len(),
+                            is_stream_json,
+                            "Wave worker: first stdout line received"
+                        );
+                    }
+                    let delta = if is_stream_json {
+                        // Parse NDJSON and extract readable content
                         use ralph_adapters::{
                             ClaudeStreamEvent, ClaudeStreamParser, ContentBlock,
                         };
-                        use tokio::io::{AsyncBufReadExt, BufReader};
-                        let reader = BufReader::new(stdout);
-                        let mut stdout_lines = reader.lines();
-                        let mut line_count: u64 = 0;
-                        while let Some(line) = stdout_lines.next_line().await? {
-                            line_count += 1;
-                            if line_count == 1 {
-                                info!(
-                                    worker = index,
-                                    line_len = line.len(),
-                                    is_stream_json,
-                                    "Wave worker: first stdout line received"
-                                );
+                        match ClaudeStreamParser::parse_line(&line) {
+                            Some(ClaudeStreamEvent::Assistant {
+                                message, ..
+                            }) => {
+                                let mut text = String::new();
+                                for block in message.content {
+                                    match block {
+                                        ContentBlock::Text { text: t } => {
+                                            text.push_str(&t);
+                                            text.push('\n');
+                                        }
+                                        ContentBlock::ToolUse {
+                                            name,
+                                            input,
+                                            ..
+                                        } => {
+                                            text.push_str(&format!(
+                                                "⚙ {name}({input})\n"
+                                            ));
+                                        }
+                                    }
+                                }
+                                if text.is_empty() {
+                                    None
+                                } else {
+                                    Some(text)
+                                }
                             }
-                            let delta = if is_stream_json {
-                                // Parse NDJSON and extract readable content
-                                match ClaudeStreamParser::parse_line(&line) {
-                                    Some(ClaudeStreamEvent::Assistant {
-                                        message, ..
-                                    }) => {
-                                        let mut text = String::new();
-                                        for block in message.content {
-                                            match block {
-                                                ContentBlock::Text { text: t } => {
-                                                    text.push_str(&t);
-                                                    text.push('\n');
-                                                }
-                                                ContentBlock::ToolUse {
-                                                    name,
-                                                    input,
-                                                    ..
-                                                } => {
-                                                    text.push_str(&format!(
-                                                        "⚙ {name}({input})\n"
-                                                    ));
-                                                }
+                            Some(ClaudeStreamEvent::User { message }) => {
+                                let mut text = String::new();
+                                for block in message.content {
+                                    let ralph_adapters::UserContentBlock::ToolResult { content, .. } = block;
+                                    if !content.is_empty() {
+                                        text.push_str(&format!(
+                                            "→ {}\n",
+                                            if content.len() > 200 {
+                                                format!("{}…", &content[..200])
+                                            } else {
+                                                content
                                             }
-                                        }
-                                        if text.is_empty() {
-                                            None
-                                        } else {
-                                            Some(text)
-                                        }
+                                        ));
                                     }
-                                    Some(ClaudeStreamEvent::User { message }) => {
-                                        let mut text = String::new();
-                                        for block in message.content {
-                                            let ralph_adapters::UserContentBlock::ToolResult { content, .. } = block;
-                                            if !content.is_empty() {
-                                                text.push_str(&format!(
-                                                    "→ {}\n",
-                                                    if content.len() > 200 {
-                                                        format!("{}…", &content[..200])
-                                                    } else {
-                                                        content
-                                                    }
-                                                ));
-                                            }
-                                        }
-                                        if text.is_empty() {
-                                            None
-                                        } else {
-                                            Some(text)
-                                        }
-                                    }
-                                    _ => None, // Skip System/Result events
                                 }
-                            } else {
-                                // Text format: forward raw lines
-                                Some(format!("{line}\n"))
-                            };
+                                if text.is_empty() {
+                                    None
+                                } else {
+                                    Some(text)
+                                }
+                            }
+                            _ => None, // Skip System/Result events
+                        }
+                    } else {
+                        // Text format: forward raw lines
+                        Some(format!("{line}\n"))
+                    };
 
-                            if let Some(ref delta) = delta {
-                                debug!(
-                                    worker = index,
-                                    delta_len = delta.len(),
-                                    rpc_tx = worker_rpc_tx.is_some(),
-                                    tui_state = worker_tui_state.is_some(),
-                                    "Wave worker stdout: sending text delta"
-                                );
-                                if let Some(ref rpc_tx) = worker_rpc_tx {
-                                    let _ = rpc_tx
-                                        .send(RpcEvent::WaveWorkerTextDelta {
-                                            worker_index: index,
-                                            delta: delta.clone(),
-                                        })
-                                        .await;
-                                }
-                                if let Some(ref state) = worker_tui_state {
-                                    if let Ok(s) = state.lock() {
-                                        if let Some(ref wave) = s.wave_active {
-                                            if let Some(buffer) =
-                                                wave.worker_buffers.get(index as usize)
-                                            {
-                                                let handle = buffer.lines_handle();
-                                                if let Ok(mut buf_lines) = handle.lock() {
-                                                    let new_lines = ralph_tui::text_to_lines(delta);
-                                                    debug!(
-                                                        worker = index,
-                                                        new_lines = new_lines.len(),
-                                                        total_lines = buf_lines.len() + new_lines.len(),
-                                                        "Wave worker TUI delta push"
-                                                    );
-                                                    buf_lines.extend(new_lines);
-                                                }
-                                            }
-                                        } else {
-                                            debug!(worker = index, "Wave worker: wave_active is None");
+                    if let Some(ref delta) = delta {
+                        if let Some(ref rpc_tx) = worker_rpc_tx {
+                            let _ = rpc_tx
+                                .send(RpcEvent::WaveWorkerTextDelta {
+                                    worker_index: index,
+                                    delta: delta.clone(),
+                                })
+                                .await;
+                        }
+                        if let Some(ref state) = worker_tui_state {
+                            if let Ok(s) = state.lock() {
+                                if let Some(ref wave) = s.wave_active {
+                                    if let Some(buffer) =
+                                        wave.worker_buffers.get(index as usize)
+                                    {
+                                        let handle = buffer.lines_handle();
+                                        if let Ok(mut buf_lines) = handle.lock() {
+                                            buf_lines.extend(ralph_tui::text_to_lines(delta));
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    Ok::<_, std::io::Error>(())
-                };
-
-                // Read stderr concurrently to prevent pipe buffer deadlock
-                let stderr_future = async {
-                    if let Some(stderr) = stderr_handle {
-                        use tokio::io::{AsyncBufReadExt, BufReader};
-                        let reader = BufReader::new(stderr);
-                        let mut lines = reader.lines();
-                        while let Some(line) = lines.next_line().await? {
-                            // Log worker stderr for debugging (otherwise errors are invisible)
-                            if !line.trim().is_empty() {
-                                debug!(worker = index, stderr = %line, "Wave worker stderr");
-                            }
-                        }
-                    }
-                    Ok::<_, std::io::Error>(())
-                };
-
-                tokio::try_join!(stdout_future, stderr_future)
+                }
+                Ok::<_, std::io::Error>(())
             };
 
             match tokio::time::timeout(wave_timeout, stream_result).await {
@@ -2839,24 +2839,15 @@ async fn execute_wave(
                     warn!(
                         timeout_secs = wave_timeout.as_secs(),
                         worker = index,
-                        "Wave worker timeout, sending SIGTERM"
+                        "Wave worker timeout, killing process"
                     );
                     timed_out = true;
-                    #[cfg(unix)]
-                    if let Some(pid) = child.id() {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let pid = nix::unistd::Pid::from_raw(pid as i32);
-                        let _ =
-                            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = child.start_kill();
-                    }
+                    let _ = child.kill();
                 }
             }
 
-            let status = child.wait().await;
+            let status = child.wait();
+            let _ = reader_handle.join();
             let success =
                 status.map(|s| s.success() && !timed_out).unwrap_or(false);
             let duration = start.elapsed();
