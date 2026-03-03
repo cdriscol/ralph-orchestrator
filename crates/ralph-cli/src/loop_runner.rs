@@ -2674,6 +2674,11 @@ async fn execute_wave(
             for (key, value) in &worker_backend.env_vars {
                 cmd_builder.env(key, value);
             }
+            // Suppress interactive terminal formatting from Claude Code.
+            // The PTY makes the child see a TTY (needed for unbuffered stdout),
+            // but we only want NDJSON output, not interactive progress indicators.
+            cmd_builder.env("TERM", "dumb");
+            cmd_builder.env("NO_COLOR", "1");
 
             let mut child = match pty_pair.slave.spawn_command(cmd_builder) {
                 Ok(child) => child,
