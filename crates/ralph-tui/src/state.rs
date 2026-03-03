@@ -576,6 +576,10 @@ impl TuiState {
         // Exit wave view on new iteration though — the user can re-enter with 'w'.
         self.wave_view_active = false;
 
+        // Resume the total loop timer — it gets frozen on build.done/build.blocked
+        // but should keep ticking when the next iteration starts.
+        self.final_loop_elapsed = None;
+
         let hat_display = hat_display.or_else(|| {
             self.pending_hat
                 .as_ref()
