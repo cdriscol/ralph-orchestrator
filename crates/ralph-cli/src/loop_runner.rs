@@ -2783,14 +2783,14 @@ async fn execute_wave(
                                 for block in message.content {
                                     let ralph_adapters::UserContentBlock::ToolResult { content, .. } = block;
                                     if !content.is_empty() {
-                                        text.push_str(&format!(
-                                            "→ {}\n",
-                                            if content.len() > 200 {
-                                                format!("{}…", &content[..200])
-                                            } else {
-                                                content
-                                            }
-                                        ));
+                                        let truncated = if content.len() > 200 {
+                                            // Find a valid char boundary at or before 200
+                                            let end = content.floor_char_boundary(200);
+                                            format!("{}…", &content[..end])
+                                        } else {
+                                            content
+                                        };
+                                        text.push_str(&format!("→ {truncated}\n"));
                                     }
                                 }
                                 if text.is_empty() {
