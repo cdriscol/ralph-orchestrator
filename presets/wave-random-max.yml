@@ -1,0 +1,74 @@
+# Wave Random Max: Simple wave smoke test
+# Pattern: Dispatch random number of workers, each picks a random number, aggregator finds the max
+#
+# 3 Hats:
+# - Dispatcher: Picks random worker count (2-5) and emits that many wave events
+# - Roller: Generates a random number 1-100 via bash
+# - Picker: Finds the maximum from all results and emits LOOP_COMPLETE
+#
+# Usage:
+#   ralph run --hats presets/wave-random-max.yml --prompt "Roll the dice"
+
+event_loop:
+  completion_promise: "LOOP_COMPLETE"
+  starting_event: "roll.start"
+  max_iterations: 5
+  max_runtime_seconds: 120
+
+cli:
+  backend: "claude"
+
+hats:
+  dispatcher:
+    name: "🎲 Dispatcher"
+    triggers: ["roll.start"]
+    publishes: ["roll.number"]
+    instructions: |
+      Pick a random number of workers between 2 and 5 (inclusive), then dispatch
+      that many wave events. Each payload is just "Roll a random number".
+
+      Run this exact command (replacing N with your chosen count):
+
+      ```bash
+      ralph wave emit roll.number --payloads "Roll a random number" "Roll a random number"
+      ```
+
+      Add more "Roll a random number" payload args to match your chosen count (2-5 total).
+      Do nothing else.
+
+  roller:
+    name: "🎰 Roller"
+    triggers: ["roll.number"]
+    publishes: ["roll.result"]
+    concurrency: 5
+    timeout: 60
+    instructions: |
+      Generate a random number between 1 and 100 using bash:
+
+      ```bash
+      ralph emit roll.result "$(shuf -i 1-100 -n 1)"
+      ```
+
+      Run that command and nothing else.
+
+  picker:
+    name: "🏆 Picker"
+    triggers: ["roll.result"]
+    publishes: ["LOOP_COMPLETE"]
+    disallowed_tools: ["Read", "Glob", "Grep", "Edit"]
+    default_publishes: "LOOP_COMPLETE"
+    aggregate:
+      mode: wait_for_all
+      timeout: 60
+    instructions: |
+      Look at all roll.result events in PENDING EVENTS above. Each payload is
+      a number between 1 and 100.
+
+      1. List all the numbers
+      2. Identify the maximum
+      3. Print: "The winning number is: [max]"
+      4. Emit LOOP_COMPLETE:
+
+      ```bash
+      ralph emit LOOP_COMPLETE "Max was [max] out of [count] rolls"
+      ```

@@ -1,0 +1,89 @@
+# Wave Rock-Paper-Scissors: Tournament via waves
+# Pattern: Random players throw RPS in parallel, coordinator eliminates until one winner
+#
+# 2 Hats:
+# - Coordinator: Picks 2-5 players, dispatches waves, judges results, loops until winner
+# - Player: Randomly throws rock, paper, or scissors
+#
+# Usage:
+#   ralph run --hats presets/wave-rps.yml --prompt "Rock paper scissors tournament"
+
+event_loop:
+  completion_promise: "LOOP_COMPLETE"
+  starting_event: "rps.start"
+  max_iterations: 20
+  max_runtime_seconds: 300
+
+cli:
+  backend: "claude"
+
+hats:
+  coordinator:
+    name: "🏟️ Coordinator"
+    description: "Dispatches players, judges rounds, and loops until one winner remains."
+    triggers: ["rps.start", "rps.result"]
+    publishes: ["rps.throw", "LOOP_COMPLETE"]
+    instructions: |
+      ## ROCK-PAPER-SCISSORS TOURNAMENT COORDINATOR
+
+      You coordinate an RPS tournament. On each activation you either start a
+      new round or judge results from the previous round.
+
+      ### When you see `rps.start` (first round)
+
+      1. Pick a random number of players between 2 and 5
+      2. Dispatch them as a wave — each payload is just "Throw!":
+
+      ```bash
+      ralph wave emit rps.throw --payloads "Throw!" "Throw!" "Throw!"
+      ```
+
+      Adjust the number of "Throw!" payloads to match your player count.
+      Do nothing else — wait for results.
+
+      ### When you see `rps.result` events (judging)
+
+      Each rps.result payload is one of: rock, paper, or scissors.
+
+      1. List all throws
+      2. Determine the outcome:
+         - If all throws are identical → TIE (restart)
+         - If all three types appear (rock + paper + scissors) → TIE (restart)
+         - Otherwise one type beats another — eliminate the losers
+           (rock beats scissors, scissors beats paper, paper beats rock)
+      3. If exactly 1 player survives → they WIN
+         - Print the winner and emit LOOP_COMPLETE:
+         ```bash
+         ralph emit LOOP_COMPLETE "Winner threw [move] beating [count] opponents"
+         ```
+      4. If multiple survivors remain → new round with just the survivors
+         - Dispatch a new wave with one "Throw!" per survivor:
+         ```bash
+         ralph wave emit rps.throw --payloads "Throw!" "Throw!"
+         ```
+      5. If TIE → restart with same player count
+         - Dispatch a new wave with the same number of payloads
+
+      ### Rules
+      - rock beats scissors
+      - scissors beats paper
+      - paper beats rock
+      - Print a short summary each round (e.g. "Round 2: 3 players — rock×2, scissors×1 → 2 survive")
+
+  player:
+    name: "✊ Player"
+    description: "Randomly throws rock, paper, or scissors."
+    triggers: ["rps.throw"]
+    publishes: ["rps.result"]
+    concurrency: 5
+    timeout: 30
+    instructions: |
+      You are an RPS player. Pick ONE move randomly and emit it.
+
+      Run this exact command:
+
+      ```bash
+      ralph emit rps.result "$(shuf -e rock paper scissors -n 1)"
+      ```
+
+      Do nothing else.
