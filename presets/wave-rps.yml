@@ -31,44 +31,46 @@ hats:
 
       ### When you see `rps.start` (first round)
 
-      1. Pick a random number of players between 2 and 5
-      2. Dispatch them as a wave — each payload is just "Throw!":
+      1. Read the prompt — it may contain player names. If it does, use those
+         names. If not, invent fun names (e.g. "Thunder", "Viper", "Ghost").
+      2. Pick 2-5 players (use the names from the prompt if provided)
+      3. Dispatch them as a wave — each payload is the player's name:
 
       ```bash
-      ralph wave emit rps.throw --payloads "Throw!" "Throw!" "Throw!"
+      ralph wave emit rps.throw --payloads "Thunder" "Viper" "Ghost"
       ```
 
-      Adjust the number of "Throw!" payloads to match your player count.
       Do nothing else — wait for results.
 
       ### When you see `rps.result` events (judging)
 
-      Each rps.result payload is one of: rock, paper, or scissors.
+      Each rps.result payload is "NAME: rock/paper/scissors" (e.g. "Thunder: rock").
 
-      1. List all throws
+      1. List all throws with player names (e.g. "Thunder: rock, Viper: scissors")
       2. Determine the outcome:
-         - If all throws are identical → TIE (restart)
+         - If all throws are identical → TIE (restart with same players)
          - If all three types appear (rock + paper + scissors) → TIE (restart)
          - Otherwise one type beats another — eliminate the losers
            (rock beats scissors, scissors beats paper, paper beats rock)
       3. If exactly 1 player survives → they WIN
-         - Print the winner and emit LOOP_COMPLETE:
+         - Print: "[Name] wins with [move]!"
+         - Emit LOOP_COMPLETE:
          ```bash
-         ralph emit LOOP_COMPLETE "Winner threw [move] beating [count] opponents"
+         ralph emit LOOP_COMPLETE "[Name] wins with [move]!"
          ```
       4. If multiple survivors remain → new round with just the survivors
-         - Dispatch a new wave with one "Throw!" per survivor:
+         - Dispatch a new wave with surviving player names:
          ```bash
-         ralph wave emit rps.throw --payloads "Throw!" "Throw!"
+         ralph wave emit rps.throw --payloads "Thunder" "Ghost"
          ```
-      5. If TIE → restart with same player count
-         - Dispatch a new wave with the same number of payloads
+      5. If TIE → restart with same players
+         - Dispatch a new wave with all the same player names
 
       ### Rules
       - rock beats scissors
       - scissors beats paper
       - paper beats rock
-      - Print a short summary each round (e.g. "Round 2: 3 players — rock×2, scissors×1 → 2 survive")
+      - Print a short summary each round (e.g. "Round 2: Thunder→rock, Viper→scissors, Ghost→paper → TIE!")
 
   player:
     name: "✊ Player"
