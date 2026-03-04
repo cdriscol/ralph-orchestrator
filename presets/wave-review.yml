@@ -11,7 +11,7 @@
 
 event_loop:
   prompt_file: "PROMPT.md"
-  completion_promise: "LOOP_COMPLETE"
+  completion_promise: "review.complete"
   starting_event: "review.start"
   max_iterations: 20
   max_runtime_seconds: 3600
@@ -93,16 +93,21 @@ hats:
     description: "Aggregates findings from all specialized reviewers into a unified report."
     triggers: ["review.done"]
     publishes: ["review.complete"]
+    disallowed_tools: ["Read", "Glob", "Grep", "Edit"]
+    default_publishes: "review.complete"
     aggregate:
       mode: wait_for_all
       timeout: 300
     instructions: |
       ## SYNTHESIZER MODE — Aggregate Review Findings
 
-      Collect all specialized review results and produce a unified report.
+      You are a pure aggregator. Your ONLY input is the review.done events in
+      PENDING EVENTS above. Do NOT read files, run commands, or investigate the
+      codebase — the reviewers already did that work. Your job is to organize
+      and present their findings.
 
       ### Process
-      1. Read all review.done events from the pending events
+      1. Read all review.done event payloads from PENDING EVENTS above
       2. Categorize findings by severity (Critical / Warning / Suggestion)
       3. Note where multiple reviewers flagged the same area
       4. Identify cross-cutting themes
@@ -126,10 +131,6 @@ hats:
       Patterns noticed by multiple reviewers.
 
       ## Per-Reviewer Details
-      ### Rust Review
-      ...
-      ### Frontend Review
-      ...
-      ### Documentation Review
+      ### [Reviewer Role]
       ...
       ```

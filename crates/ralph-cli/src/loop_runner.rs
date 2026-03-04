@@ -1581,6 +1581,24 @@ pub async fn run_loop_impl(
                         ) {
                             warn!(error = %e, "Failed to merge wave results to events file");
                         }
+
+                        // Re-read events file to publish wave results to the bus.
+                        // The EventReader's position was before the merge, so it picks up
+                        // only the newly appended events (e.g. review.done). These target
+                        // the aggregator hat (concurrency=1), so they're partitioned as
+                        // regular events and published to the bus — making next_hat()
+                        // find the aggregator on the next iteration.
+                        if let Ok(reread) = event_loop.process_events_from_jsonl_with_waves() {
+                            if reread.processed.had_events {
+                                info!(
+                                    "Published wave result events to bus for aggregator"
+                                );
+                                // Wave results legitimately share the same topic (e.g.
+                                // 3x review.done). Reset the stale-loop counter so
+                                // this batch doesn't trigger LoopStale termination.
+                                event_loop.reset_stale_topic_counter();
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "Wave execution failed");

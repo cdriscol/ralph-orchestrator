@@ -409,6 +409,16 @@ impl EventLoop {
         &self.state
     }
 
+    /// Resets the stale-loop topic counter.
+    ///
+    /// Call after processing wave results — multiple events with the same topic
+    /// (e.g. `review.done` from parallel workers) are expected and should not
+    /// trigger the stale loop detector.
+    pub fn reset_stale_topic_counter(&mut self) {
+        self.state.consecutive_same_topic = 0;
+        self.state.last_emitted_topic = None;
+    }
+
     /// Returns the configuration.
     pub fn config(&self) -> &RalphConfig {
         &self.config
@@ -2382,7 +2392,10 @@ impl EventLoop {
             let mut had_events = false;
             let mut has_orphans = false;
 
-            for event in &regular_events {
+            let completion_topic = self.config.event_loop.completion_promise.as_str();
+            let total_regular = regular_events.len();
+
+            for (index, event) in regular_events.iter().enumerate() {
                 let topic = &event.topic;
                 let payload = event.payload.clone().unwrap_or_default();
 
@@ -2391,6 +2404,15 @@ impl EventLoop {
 
                 if !self.registry.has_subscriber(topic.as_str()) {
                     has_orphans = true;
+                }
+
+                // Check for completion event (same logic as process_events_from_jsonl)
+                if topic.as_str() == completion_topic && index + 1 == total_regular {
+                    self.state.completion_requested = true;
+                    info!(
+                        topic = %topic,
+                        "Completion event detected in JSONL (wave path)"
+                    );
                 }
 
                 debug!(topic = %topic, "Publishing regular event from JSONL");
