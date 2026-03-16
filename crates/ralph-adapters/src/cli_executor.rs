@@ -14,7 +14,7 @@ use std::env;
 use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, warn};
 
@@ -37,6 +37,18 @@ pub struct CliExecutor {
     backend: CliBackend,
 }
 
+enum StreamEvent {
+    StdoutLine(String),
+    StderrLine(String),
+    StdoutEof,
+    StderrEof,
+}
+
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
 impl CliExecutor {
     /// Creates a new executor with the given backend.
     pub fn new(backend: CliBackend) -> Self {
@@ -46,8 +58,9 @@ impl CliExecutor {
     /// Executes a prompt and streams output to the provided writer.
     ///
     /// Output is streamed line-by-line to the writer while being accumulated
-    /// for the return value. If `timeout` is provided and the execution exceeds
-    /// it, the process receives SIGTERM and the result indicates timeout.
+    /// for the return value. If `timeout` is provided and the execution produces
+    /// no stdout/stderr activity for longer than that duration, the process
+    /// receives SIGTERM and the result indicates timeout.
     ///
     /// When `verbose` is true, stderr output is also written to the output writer
     /// with a `[stderr]` prefix. When false, stderr is captured but not displayed.
@@ -99,92 +112,83 @@ impl CliExecutor {
 
         let mut timed_out = false;
 
-        // Take both stdout and stderr handles upfront to read concurrently
-        // This prevents deadlock when stderr fills its buffer before stdout produces output
+        // Take both stdout and stderr handles upfront to read concurrently.
+        // Each emitted line resets the inactivity timeout.
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
 
-        // Wrap the streaming in a timeout if configured
-        // Read stdout and stderr CONCURRENTLY to avoid pipe buffer deadlock
-        let stream_result = async {
-            // Create futures for reading both streams
-            let stdout_future = async {
-                let mut lines_out = Vec::new();
-                if let Some(stdout) = stdout_handle {
-                    let reader = BufReader::new(stdout);
-                    let mut lines = reader.lines();
-                    while let Some(line) = lines.next_line().await? {
-                        lines_out.push(line);
-                    }
-                }
-                Ok::<_, std::io::Error>(lines_out)
-            };
+        let stdout_task = stdout_handle.map(|stdout| {
+            let tx = event_tx.clone();
+            tokio::spawn(async move { read_stream(stdout, tx, StreamKind::Stdout).await })
+        });
+        let stderr_task = stderr_handle.map(|stderr| {
+            let tx = event_tx.clone();
+            tokio::spawn(async move { read_stream(stderr, tx, StreamKind::Stderr).await })
+        });
+        drop(event_tx);
 
-            let stderr_future = async {
-                let mut lines_out = Vec::new();
-                if let Some(stderr) = stderr_handle {
-                    let reader = BufReader::new(stderr);
-                    let mut lines = reader.lines();
-                    while let Some(line) = lines.next_line().await? {
-                        lines_out.push(line);
-                    }
-                }
-                Ok::<_, std::io::Error>(lines_out)
-            };
+        let mut stdout_done = stdout_task.is_none();
+        let mut stderr_done = stderr_task.is_none();
+        let mut accumulated_output = String::new();
 
-            // Read both streams concurrently to prevent deadlock
-            let (stdout_lines, stderr_lines) = tokio::try_join!(stdout_future, stderr_future)?;
+        if let Some(duration) = timeout {
+            debug!(
+                timeout_secs = duration.as_secs(),
+                "Executing with inactivity timeout"
+            );
+        }
 
-            // Write stdout lines first (main output)
-            for line in &stdout_lines {
-                writeln!(output_writer, "{line}")?;
-            }
-
-            // Write stderr lines (prefixed) only in verbose mode
-            if verbose {
-                for line in &stderr_lines {
-                    writeln!(output_writer, "[stderr] {line}")?;
-                }
-            }
-
-            output_writer.flush()?;
-
-            // Build accumulated output (stdout first, then stderr)
-            let mut accumulated = String::new();
-            for line in stdout_lines {
-                accumulated.push_str(&line);
-                accumulated.push('\n');
-            }
-            for line in stderr_lines {
-                accumulated.push_str("[stderr] ");
-                accumulated.push_str(&line);
-                accumulated.push('\n');
-            }
-
-            Ok::<_, std::io::Error>(accumulated)
-        };
-
-        let accumulated_output = match timeout {
-            Some(duration) => {
-                debug!(timeout_secs = duration.as_secs(), "Executing with timeout");
-                match tokio::time::timeout(duration, stream_result).await {
-                    Ok(result) => result?,
+        while !stdout_done || !stderr_done {
+            let next_event = match timeout {
+                Some(duration) => match tokio::time::timeout(duration, event_rx.recv()).await {
+                    Ok(event) => event,
                     Err(_) => {
-                        // Timeout elapsed - send SIGTERM to the child process
                         warn!(
                             timeout_secs = duration.as_secs(),
-                            "Execution timeout reached, sending SIGTERM"
+                            "Execution inactivity timeout reached, sending SIGTERM"
                         );
                         timed_out = true;
                         Self::terminate_child(&mut child)?;
-                        String::new() // Return empty output on timeout
+                        break;
                     }
+                },
+                None => event_rx.recv().await,
+            };
+
+            match next_event {
+                Some(StreamEvent::StdoutLine(line)) => {
+                    writeln!(output_writer, "{line}")?;
+                    output_writer.flush()?;
+                    accumulated_output.push_str(&line);
+                    accumulated_output.push('\n');
+                }
+                Some(StreamEvent::StderrLine(line)) => {
+                    if verbose {
+                        writeln!(output_writer, "[stderr] {line}")?;
+                        output_writer.flush()?;
+                    }
+                    accumulated_output.push_str("[stderr] ");
+                    accumulated_output.push_str(&line);
+                    accumulated_output.push('\n');
+                }
+                Some(StreamEvent::StdoutEof) => stdout_done = true,
+                Some(StreamEvent::StderrEof) => stderr_done = true,
+                None => {
+                    stdout_done = true;
+                    stderr_done = true;
                 }
             }
-            None => stream_result.await?,
-        };
+        }
 
         let status = child.wait().await?;
+
+        if let Some(handle) = stdout_task {
+            handle.await.map_err(join_error_to_io)??;
+        }
+        if let Some(handle) = stderr_task {
+            handle.await.map_err(join_error_to_io)??;
+        }
 
         Ok(ExecutionResult {
             output: accumulated_output,
@@ -233,6 +237,38 @@ impl CliExecutor {
         let sink = std::io::sink();
         self.execute(prompt, sink, timeout, false).await
     }
+}
+
+async fn read_stream<R>(
+    stream: R,
+    tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    stream_kind: StreamKind,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        let event = match stream_kind {
+            StreamKind::Stdout => StreamEvent::StdoutLine(line),
+            StreamKind::Stderr => StreamEvent::StderrLine(line),
+        };
+        if tx.send(event).await.is_err() {
+            return Ok(());
+        }
+    }
+
+    let eof_event = match stream_kind {
+        StreamKind::Stdout => StreamEvent::StdoutEof,
+        StreamKind::Stderr => StreamEvent::StderrEof,
+    };
+    let _ = tx.send(eof_event).await;
+    Ok(())
+}
+
+fn join_error_to_io(error: tokio::task::JoinError) -> std::io::Error {
+    std::io::Error::other(error.to_string())
 }
 
 fn inject_ralph_runtime_env(command: &mut Command, workspace_root: &std::path::Path) {
@@ -355,6 +391,63 @@ mod tests {
             !result.success,
             "Timed out execution should not be successful"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_timeout_resets_on_output_activity() {
+        let backend = CliBackend {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string()],
+            prompt_mode: PromptMode::Arg,
+            prompt_flag: None,
+            output_format: OutputFormat::Text,
+            env_vars: vec![],
+        };
+
+        let executor = CliExecutor::new(backend);
+        let timeout = Some(Duration::from_millis(300));
+        let result = executor
+            .execute_capture_with_timeout(
+                "printf 'start\\n'; sleep 0.2; printf 'middle\\n'; sleep 0.2; printf 'done\\n'",
+                timeout,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !result.timed_out,
+            "Periodic output should reset the inactivity timeout"
+        );
+        assert!(result.success, "Periodic-output command should succeed");
+        assert!(result.output.contains("start"));
+        assert!(result.output.contains("middle"));
+        assert!(result.output.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_streams_output_before_inactivity_timeout() {
+        let backend = CliBackend {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "printf 'hello\\n'; sleep 10".to_string()],
+            prompt_mode: PromptMode::Stdin,
+            prompt_flag: None,
+            output_format: OutputFormat::Text,
+            env_vars: vec![],
+        };
+
+        let executor = CliExecutor::new(backend);
+        let mut output = Vec::new();
+        let result = executor
+            .execute("", &mut output, Some(Duration::from_millis(200)), false)
+            .await
+            .unwrap();
+
+        assert!(
+            result.timed_out,
+            "Expected inactivity timeout after output stops"
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), "hello\n");
+        assert!(result.output.contains("hello"));
     }
 
     #[tokio::test]
