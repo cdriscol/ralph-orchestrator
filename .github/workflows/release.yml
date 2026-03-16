@@ -298,16 +298,22 @@ jobs:
       - name: Publish crates to crates.io
         run: |
           # Publish crates in dependency order with delays for registry indexing
-          # Order: ralph-proto -> ralph-telegram -> ralph-core -> ralph-adapters, ralph-tui -> ralph-cli
+          # Order: ralph-proto -> ralph-telegram -> ralph-core -> ralph-api -> ralph-adapters, ralph-tui -> ralph-cli
 
           publish_crate() {
             local crate=$1
             echo "Publishing $crate..."
-            if cargo publish -p "$crate" --no-verify 2>&1; then
+            if cargo publish -p "$crate" --no-verify 2>&1 | tee /tmp/publish-$crate.log; then
               echo "$crate published successfully"
             else
-              # Continue if it failed because the version already exists (idempotent re-runs)
-              echo "Warning: $crate publish returned an error (may already exist), continuing..."
+              local log=$(cat /tmp/publish-$crate.log)
+              if echo "$log" | grep -q "already uploaded"; then
+                echo "$crate already published at this version, skipping."
+              else
+                echo "::error::Failed to publish $crate"
+                cat /tmp/publish-$crate.log
+                exit 1
+              fi
             fi
             sleep 30
           }
@@ -315,6 +321,7 @@ jobs:
           publish_crate ralph-proto
           publish_crate ralph-telegram
           publish_crate ralph-core
+          publish_crate ralph-api
           publish_crate ralph-adapters
           publish_crate ralph-tui
           publish_crate ralph-cli
