@@ -5758,7 +5758,10 @@ async fn run_wave_worker_pty(
                 let _ = tx.send((index, false, duration));
                 return (
                     index,
-                    Err((format!("PTY stdin temp file creation failed: {e}"), duration)),
+                    Err((
+                        format!("PTY stdin temp file creation failed: {e}"),
+                        duration,
+                    )),
                 );
             }
         };
@@ -6266,12 +6269,14 @@ mod tests {
             }
 
             let probe = dir.join(format!(".ralph-fake-path-probe-{}", std::process::id()));
-            match OpenOptions::new().write(true).create_new(true).open(&probe) {
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&probe);
-                    return dir;
-                }
-                Err(_) => continue,
+            if OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+                .is_ok()
+            {
+                let _ = std::fs::remove_file(&probe);
+                return dir;
             }
         }
 
