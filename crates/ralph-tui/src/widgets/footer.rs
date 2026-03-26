@@ -129,6 +129,13 @@ impl Widget for Footer<'_> {
             "Total Time Elapsed: 00:00".to_string()
         };
         left_spans.push(Span::raw(elapsed_display));
+        if self.state.mouse_capture_enabled {
+            left_spans.push(Span::raw(" │ "));
+            left_spans.push(Span::styled(
+                "Mouse: scroll (m)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
 
         let indicator_text = if self.state.loop_completed {
             "■ DONE"
@@ -350,6 +357,25 @@ mod tests {
             text.contains('◉') && text.contains("ACTIVE"),
             "should show ACTIVE indicator at startup, got: {}",
             text
+        );
+    }
+
+    #[test]
+    fn footer_shows_mouse_mode() {
+        let mut state = TuiState::new();
+        let select_text = render_to_string(&state);
+        assert!(
+            !select_text.contains("Mouse:"),
+            "should keep default footer uncluttered when mouse capture is off, got: {}",
+            select_text
+        );
+
+        state.mouse_capture_enabled = true;
+        let scroll_text = render_to_string(&state);
+        assert!(
+            scroll_text.contains("Mouse: scroll (m)"),
+            "should show scroll mode when mouse capture enabled, got: {}",
+            scroll_text
         );
     }
 }

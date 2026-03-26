@@ -49,6 +49,10 @@ pub fn render(f: &mut Frame, area: Rect) {
             Span::styled("  G", Style::default().fg(Color::Cyan)),
             Span::raw("      Scroll to bottom"),
         ]),
+        Line::from(vec![
+            Span::styled("  m", Style::default().fg(Color::Cyan)),
+            Span::raw("      Toggle mouse mode (select/scroll)"),
+        ]),
         Line::from(""),
         Line::from(Span::styled("Search:", Style::default().fg(Color::Yellow))),
         Line::from(vec![

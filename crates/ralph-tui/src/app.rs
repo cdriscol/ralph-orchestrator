@@ -118,9 +118,21 @@ pub fn dispatch_action(action: Action, state: &mut TuiState, viewport_height: us
         Action::EnterWaveView => {
             state.enter_wave_view();
         }
+        Action::ToggleMouseMode => {
+            state.mouse_capture_enabled = !state.mouse_capture_enabled;
+        }
         Action::None => {}
     }
     false
+}
+
+fn set_mouse_capture(enabled: bool) -> Result<()> {
+    if enabled {
+        execute!(io::stdout(), EnableMouseCapture)?;
+    } else {
+        execute!(io::stdout(), DisableMouseCapture)?;
+    }
+    Ok(())
 }
 
 /// Main TUI application for read-only observation.
@@ -172,7 +184,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> App<W> {
     pub async fn run(mut self) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.clear()?;
@@ -181,9 +193,17 @@ impl<W: AsyncWrite + Unpin + Send + 'static> App<W> {
         // When cleanup_tui() calls handle.abort(), the task is cancelled immediately
         // at its current await point, skipping all code after the loop. This defer!
         // guard runs on Drop, which is guaranteed even during task cancellation.
+        let cleanup_state = Arc::clone(&self.state);
         defer! {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
+            let mouse_capture_enabled = cleanup_state
+                .lock()
+                .map(|state| state.mouse_capture_enabled)
+                .unwrap_or(false);
+            if mouse_capture_enabled {
+                let _ = execute!(io::stdout(), DisableMouseCapture);
+            }
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
         }
 
         let update_state = Arc::clone(&self.state);
@@ -326,8 +346,14 @@ impl<W: AsyncWrite + Unpin + Send + 'static> App<W> {
                                     // Map key to action and dispatch
                                     let action = map_key(key);
                                     let mut state = self.state.lock().unwrap();
+                                    let mouse_capture_enabled_before = state.mouse_capture_enabled;
                                     if dispatch_action(action, &mut state, viewport_height) {
                                         break;
+                                    }
+                                    let mouse_capture_enabled_after = state.mouse_capture_enabled;
+                                    drop(state);
+                                    if mouse_capture_enabled_before != mouse_capture_enabled_after {
+                                        set_mouse_capture(mouse_capture_enabled_after)?;
                                     }
                                 }
                                 // Ignore other events (FocusGained, FocusLost, Paste, Resize, key releases)
@@ -626,6 +652,18 @@ mod tests {
         assert!(!should_quit, "Non-quit actions should return false");
     }
 
+    #[test]
+    fn dispatch_action_toggle_mouse_mode_flips_state() {
+        let mut state = TuiState::new();
+        assert!(!state.mouse_capture_enabled);
+
+        dispatch_action(Action::ToggleMouseMode, &mut state, 10);
+        assert!(state.mouse_capture_enabled);
+
+        dispatch_action(Action::ToggleMouseMode, &mut state, 10);
+        assert!(!state.mouse_capture_enabled);
+    }
+
     // =========================================================================
     // AC6: No PTY Code — Structural Test
     // =========================================================================
@@ -684,6 +722,14 @@ mod tests {
             production_code.contains("KeyCode::Char('c')")
                 && production_code.contains("KeyModifiers::CONTROL"),
             "Production code must detect Ctrl+C via crossterm events"
+        );
+    }
+
+    #[test]
+    fn mouse_capture_starts_disabled_by_default() {
+        assert!(
+            !TuiState::new().mouse_capture_enabled,
+            "Production TUI should start with mouse capture disabled so native text selection works by default"
         );
     }
 }

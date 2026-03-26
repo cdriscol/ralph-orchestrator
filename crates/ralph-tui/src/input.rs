@@ -42,6 +42,8 @@ pub enum Action {
     GuidanceNow,
     /// Enter wave worker drill-down view
     EnterWaveView,
+    /// Toggle mouse capture for wheel scrolling vs native text selection
+    ToggleMouseMode,
     /// Key not mapped to any action
     None,
 }
@@ -59,6 +61,7 @@ pub enum Action {
 /// - `/`: Start search
 /// - `n`: Next search match
 /// - `N`: Previous search match
+/// - `m`: Toggle mouse mode
 /// - `?`: Show help
 /// - `Esc`: Dismiss help/cancel search
 pub fn map_key(key: KeyEvent) -> Action {
@@ -87,6 +90,9 @@ pub fn map_key(key: KeyEvent) -> Action {
 
         // Wave view
         KeyCode::Char('w') => Action::EnterWaveView,
+
+        // Mouse mode
+        KeyCode::Char('m') => Action::ToggleMouseMode,
 
         // Help
         KeyCode::Char('?') => Action::ShowHelp,
@@ -214,7 +220,14 @@ mod tests {
         assert_eq!(map_key(key), Action::GuidanceNow);
     }
 
-    // AC17: Unknown Key Returns None
+    // AC17: m Toggles Mouse Mode
+    #[test]
+    fn m_returns_toggle_mouse_mode() {
+        let key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(map_key(key), Action::ToggleMouseMode);
+    }
+
+    // AC18: Unknown Key Returns None
     #[test]
     fn unknown_key_returns_none() {
         let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);

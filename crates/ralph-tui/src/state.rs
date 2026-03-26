@@ -192,6 +192,9 @@ pub struct TuiState {
     pub last_event_at: Option<Instant>,
     /// Whether to show help overlay.
     pub show_help: bool,
+    /// Whether mouse capture is enabled for wheel scrolling.
+    /// When false, the terminal keeps native drag-to-select behavior.
+    pub mouse_capture_enabled: bool,
     /// Whether in scroll mode.
     pub in_scroll_mode: bool,
     /// Current search query (if in search input mode).
@@ -310,6 +313,7 @@ impl TuiState {
             last_event: None,
             last_event_at: None,
             show_help: false,
+            mouse_capture_enabled: false,
             in_scroll_mode: false,
             search_query: String::new(),
             search_forward: true,
