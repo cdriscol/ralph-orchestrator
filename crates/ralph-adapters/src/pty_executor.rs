@@ -294,8 +294,18 @@ impl PtyExecutor {
             })
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let (cmd, args, stdin_input, temp_file) =
-            self.backend.build_command(prompt, self.config.interactive);
+        // Build the command. For non-interactive PTY mode with large prompts,
+        // force arg mode because the PTY line discipline limits canonical
+        // input to ~4 KB per line. Large prompts (30-50 KB+) deadlock when
+        // written through PTY stdin. By forcing arg mode, the prompt is passed
+        // as a command argument (or via temp file for prompts > 7000 chars),
+        // bypassing the PTY input path entirely.  See #280.
+        let use_pty_safe = !self.config.interactive && prompt.len() > 4000;
+        let (cmd, args, stdin_input, temp_file) = if use_pty_safe {
+            self.backend.build_command_pty(prompt)
+        } else {
+            self.backend.build_command(prompt, self.config.interactive)
+        };
 
         let mut cmd_builder = CommandBuilder::new(&cmd);
         cmd_builder.args(&args);
@@ -2495,6 +2505,93 @@ mod tests {
         assert!(result.output.contains("stdin-line"));
         assert!(result.stripped_output.contains("stdin-line"));
         assert_eq!(result.termination, TerminationType::Natural);
+    }
+
+    /// Regression test for #280: large stdin-mode prompts deadlocked the PTY
+    /// because the PTY line discipline limits canonical input to ~4KB. The fix
+    /// converts stdin-mode to arg-mode in non-interactive PTY execution via
+    /// `build_command_pty`, so the prompt is passed as a command argument
+    /// (with temp file for very large prompts) instead of through PTY stdin.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_pty_converts_stdin_to_arg_for_large_prompt() {
+        let _temp_dir = TempDir::new().expect("temp dir");
+        let backend = CliBackend {
+            command: "echo".to_string(),
+            args: vec![],
+            prompt_mode: PromptMode::Stdin,
+            prompt_flag: Some("-p".to_string()),
+            output_format: OutputFormat::Text,
+            env_vars: vec![],
+        };
+
+        // Verify build_command_pty converts stdin to arg mode
+        let large_prompt = "x".repeat(32_000);
+        let (cmd, args, stdin_input, temp_file) = backend.build_command_pty(&large_prompt);
+        assert_eq!(cmd, "echo");
+        // stdin_input should be None (converted to arg mode)
+        assert!(stdin_input.is_none(), "PTY mode should not use stdin");
+        // Large prompt should use temp file
+        assert!(temp_file.is_some(), "Large prompt should use temp file");
+        // Args should contain the temp file instruction
+        assert!(
+            args.iter().any(|a| a.contains("Please read and execute")),
+            "args should contain temp file instruction: {:?}",
+            args
+        );
+
+        // Also verify a small prompt goes directly as arg
+        let small_prompt = "hello world";
+        let (_, args, stdin_input, temp_file) = backend.build_command_pty(small_prompt);
+        assert!(stdin_input.is_none());
+        assert!(temp_file.is_none());
+        assert!(args.iter().any(|a| a == small_prompt));
+    }
+
+    /// Verify that PTY execution with stdin-mode backend completes without
+    /// deadlock by confirming the prompt is delivered via arg mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_observe_large_stdin_backend_does_not_deadlock() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        // Use echo which just prints its args — confirms the prompt arrives via
+        // arg mode (not stdin) in PTY context.
+        let backend = CliBackend {
+            command: "echo".to_string(),
+            args: vec![],
+            prompt_mode: PromptMode::Stdin,
+            prompt_flag: Some("-p".to_string()),
+            output_format: OutputFormat::Text,
+            env_vars: vec![],
+        };
+        let config = PtyConfig {
+            interactive: false,
+            idle_timeout_secs: 0,
+            cols: 32768,
+            rows: 24,
+            workspace_root: temp_dir.path().to_path_buf(),
+        };
+        let executor = PtyExecutor::new(backend, config);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        let large_prompt = "x".repeat(32_000);
+
+        // Before the fix, this would hang forever with stdin-mode backends.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            executor.run_observe(&large_prompt, rx),
+        )
+        .await
+        .expect("should not deadlock")
+        .expect("run_observe");
+
+        assert!(result.success);
+        // echo should have printed the temp file instruction
+        assert!(
+            result.output.contains("Please read and execute"),
+            "output should contain temp file instruction: {}",
+            &result.output[..result.output.len().min(200)]
+        );
     }
 
     #[cfg(unix)]

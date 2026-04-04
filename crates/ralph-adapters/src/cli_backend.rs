@@ -659,6 +659,30 @@ impl CliBackend {
         }
     }
 
+    /// Builds the command for PTY (non-interactive) execution.
+    ///
+    /// Forces arg mode to avoid PTY line-discipline deadlocks on large prompts.
+    /// The PTY canonical input buffer (~4 KB) cannot handle 30-50 KB+ prompts
+    /// delivered via stdin. Instead, the prompt is passed as a command argument
+    /// (with temp-file indirection for prompts over 7000 chars).  See #280.
+    pub fn build_command_pty(
+        &self,
+        prompt: &str,
+    ) -> (String, Vec<String>, Option<String>, Option<NamedTempFile>) {
+        if self.prompt_mode == PromptMode::Stdin {
+            // Convert stdin-mode to arg-mode for PTY safety
+            let mut pty_backend = self.clone();
+            pty_backend.prompt_mode = PromptMode::Arg;
+            // Use -p flag for Claude when forcing arg mode
+            if pty_backend.prompt_flag.is_none() {
+                pty_backend.prompt_flag = Some("-p".to_string());
+            }
+            pty_backend.build_command(prompt, false)
+        } else {
+            self.build_command(prompt, false)
+        }
+    }
+
     /// Builds the full command with arguments for execution.
     ///
     /// # Arguments
@@ -856,6 +880,41 @@ mod tests {
         assert!(args.contains(&"--print".to_string()));
         assert_eq!(stdin, Some(large_prompt));
         assert!(temp.is_none());
+    }
+
+    /// Regression test for #280: build_command_pty converts Claude's stdin mode
+    /// to arg mode so large prompts don't deadlock the PTY line discipline.
+    #[test]
+    fn test_claude_build_command_pty_uses_arg_mode() {
+        let backend = CliBackend::claude();
+        let large_prompt = "x".repeat(7001);
+        let (cmd, args, stdin, temp) = backend.build_command_pty(&large_prompt);
+
+        assert_eq!(cmd, "claude");
+        // --print should still be present (headless mode flag)
+        assert!(args.contains(&"--print".to_string()));
+        // stdin should be None — prompt delivered via arg, not PTY stdin
+        assert!(stdin.is_none(), "PTY mode should not use stdin");
+        // Large prompt should use temp file
+        assert!(
+            temp.is_some(),
+            "Large prompt in PTY mode should use temp file"
+        );
+        assert!(args.iter().any(|a| a.contains("Please read and execute")));
+    }
+
+    #[test]
+    fn test_claude_build_command_pty_small_prompt_uses_arg_directly() {
+        let backend = CliBackend::claude();
+        let (cmd, args, stdin, temp) = backend.build_command_pty("small prompt");
+
+        assert_eq!(cmd, "claude");
+        assert!(args.contains(&"--print".to_string()));
+        assert!(stdin.is_none());
+        assert!(temp.is_none());
+        // The prompt should be a direct arg with -p flag
+        assert!(args.contains(&"-p".to_string()));
+        assert!(args.contains(&"small prompt".to_string()));
     }
 
     #[test]
